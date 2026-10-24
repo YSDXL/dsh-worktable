@@ -49,6 +49,7 @@
   },
   "scripts": {
     "build": "node build.mjs",
+    "dev": "node dev.mjs",
     "check": "node --check lib/index.js && node --check lib/client.js",
     "pack": "node release-prep.mjs",
     "test:gate": "node client-factory-gate.test.mjs",
@@ -76,9 +77,11 @@
     }
   },
   "devDependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
     "esbuild": "^0.25.0",
     "highlight.js": "^11.12.0",
-    "markdown-it": "^15.0.0",
-    "xterm": "^5.3.0"
+    "markdown-it": "^15.0.0"
   }
 }

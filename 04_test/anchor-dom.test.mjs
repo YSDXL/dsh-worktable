@@ -123,6 +123,7 @@ function buildSandbox() {
     window: {},
     console: { log() {}, warn() {}, error() {} },
     setTimeout, clearTimeout,
+    queueMicrotask: (cb) => Promise.resolve().then(cb),
     localStorage: localStorageStub,
     document: documentStub,
     atob: (s) => Buffer.from(String(s), 'base64').toString('binary'),
@@ -159,10 +160,10 @@ function buildSandbox() {
     })
   }
   const requireStub = (id) => {
-    if (id === 'react' || id === 'react/jsx-runtime') return makeStub()
+    if (id === 'react' || id === 'react-dom' || id === 'react/jsx-runtime') return makeStub()
     throw new Error('unexpected external require: ' + id)
   }
-  const runSandbox = { __factory: sandbox.__captured.factory, __requireStub: requireStub }
+  const runSandbox = { __factory: sandbox.__captured.factory, __requireStub: requireStub, queueMicrotask: (cb) => Promise.resolve().then(cb) }
   createContext(runSandbox)
   runInNewContext('__factory(__requireStub)', runSandbox, { timeout: 20000 })
   const splitStore = sandbox.window.__dshWorktable && sandbox.window.__dshWorktable.splitStore
@@ -265,12 +266,23 @@ function fresh() {
   ok('D. hero→active 过渡重锚定 + 关闭零泄漏')
 }
 
-// —— E. 无会话根：findConversationRoot 返回 null → open 返回 false（安全失败）——
+// —— E. 无会话根：findConversationRoot 返回 null → open 仍建立布局但不挂锚点（v0.4.1 契约变更）——
 {
   const { sandbox, splitStore } = fresh()
+  // 契约变更：布局结构与增删窗格不依赖 DOM，只有锚点挂载需要它。
+  // 无会话根时 open 返回 true（布局可用），但不碰任何 DOM —— 关闭也不能泄漏样式。
   const r = splitStore.open(makeSpec('t-e'))
-  if (r !== false) fail('E.open', 'should fail without conversation root')
-  ok('E. 无会话根时安全失败（不崩溃）')
+  if (r !== true) fail('E.open', 'should still open layout without conversation root, got ' + r)
+  if (!splitStore.spec || splitStore.spec.id !== 't-e') fail('E.spec', 'spec should be set')
+  if (splitStore.root != null) fail('E.root', 'must not hold a DOM root')
+  const w = splitStore.spec.main.length
+  const idx = splitStore.splitPane('main', 0, 'right')
+  if (idx !== 1 || splitStore.spec.main.length !== w + 1) fail('E.split', 'splitPane should work without DOM')
+  splitStore.closePane('main', 1)
+  if (splitStore.spec.main.length !== w) fail('E.closePane', 'closePane should work without DOM')
+  // 关闭后不得留下任何样式残留（DOM 不存在时本来就无从泄漏）
+  splitStore.close()
+  ok('E. 无会话根时仍能打开布局并增删窗格，不崩溃、零 DOM 泄漏')
 }
 
 // —— F. 输入包装器 / textarea 不被误选 ——

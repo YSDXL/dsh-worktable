@@ -52,7 +52,7 @@ node --check lib/index.js
   版本一致性 → **会话/输入/传输/挂载回归**（test:input / test:session / test:details / test:transport / test:widget 共 98 项，评估源码契约）→ 构建（cwd 固定 01_content）→ node --check → npm pack → 结构清单断言（package/ 前缀 + 精确 7 文件，
   无 src/、无 .map）→ 独立临时目录 npm install + import() 断言（apply 函数/inject 含 webServer+sessions/name/
   HEALTH_PATH/包内双 bundle 版本）→ **客户端工厂求值门禁**（ModuleLoader 恰好注册一次 + ID 校验 + 精确外部依赖
-  白名单 react/react/jsx-runtime + apply/inject 断言）→ **分栏锚点 DOM 回归**（8 场景，评估安装产物 lib/client.js；
+  白名单 react/react-dom/react/jsx-runtime + apply/inject 断言）→ **分栏锚点 DOM 回归**（8 场景，评估安装产物 lib/client.js；
   测试接受包路径参数）→ **服务端数据目录回归**（3 组场景，评估安装产物 lib/index.js）→ dist/v版本号/ 双资产（终态恰好 2 文件 + 双 SHA 同源）。
   脚本零 git/gh 动作，发布上传由 gh 手动完成。
   **发布禁止裸 npm pack 或手工 tar 生成发布包**；脚本从仓库任意目录调用均安全（以自身位置解析）。

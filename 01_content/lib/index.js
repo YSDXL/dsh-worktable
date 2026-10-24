@@ -2,98 +2,240 @@
 import { execFile } from "node:child_process";
 import { readdirSync, realpathSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
-import { dirname, resolve as pathResolve, sep } from "node:path";
+import { dirname as dirname2, resolve as pathResolve2, sep } from "node:path";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-// template/dshell.css
-var dshell_default = `/* dsh-worktable \u539F\u751F\u76AE\u80A4 \xB7 DSH \u8BBE\u8BA1\u7CFB\u7EDF\u7EC4\u4EF6\u5E93
-   \u7528\u6CD5\uFF1A<link rel="stylesheet" href="/api/worktable/template/dshell.css">
-   \u6240\u6709\u989C\u8272\u8D70 DSH \u4E3B\u9898\u53D8\u91CF\uFF08--dsw-alias-*\uFF09\uFF0C\u81EA\u52A8\u9002\u914D\u660E\u6697\u4E3B\u9898\u3002 */
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
-body {
-  background: var(--dsw-alias-bg-base, #0b0e14);
-  color: var(--dsw-alias-label-primary, #e6e8eb);
-  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-  font-size: 13px;
-  line-height: 1.6;
+// src/memory.ts
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { dirname, join, resolve as pathResolve } from "node:path";
+var SOUL_FILE = "SOUL.md";
+var CORE_MEMORY_FILE = "MEMORY.md";
+var MEMORY_DIR = ".dsh-worktable/memory";
+var DEFAULT_STANDING_LIMITS = { soul: 5e3, coreMemory: 3e3 };
+function readBody(root, file) {
+  const abs = join(root, file);
+  try {
+    if (!statSync(abs).isFile()) return void 0;
+    return readFileSync(abs, "utf8");
+  } catch {
+    return void 0;
+  }
 }
-.dshell { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; min-height: 100%; }
-/* \u6587\u5B57\u5C42\u7EA7 */
-.dshell-title { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #e6e8eb); }
-.dshell-sub { margin: 0; font-size: 12px; color: var(--dsw-alias-label-secondary, #9aa4b2); }
-.dshell-muted { color: var(--dsw-alias-label-tertiary, #6b7280); font-size: 11.5px; }
-/* \u5361\u7247 */
-.dshell-card { border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 10px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.02)); padding: 12px 14px; }
-.dshell-card + .dshell-card { margin-top: 10px; }
-/* \u6309\u94AE\uFF08\u7EFF\u8272\u4E3B\u6309\u94AE / \u5E7D\u7075\u6309\u94AE / \u5371\u9669\uFF09 */
-.dshell-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 999px; border: 1px solid transparent; background: #3fb950; color: #0b0e14; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
-.dshell-btn:hover { filter: brightness(1.08); }
-.dshell-btnGhost { background: transparent; border-color: var(--dsw-alias-border-l1, #262b36); color: var(--dsw-alias-label-secondary, #9aa4b2); }
-.dshell-btnGhost:hover { color: var(--dsw-alias-label-primary, #e6e8eb); border-color: var(--dsw-alias-border-l2, #3a4150); }
-.dshell-btnDanger { background: transparent; border-color: #f85149; color: #f85149; }
-/* \u72B6\u6001\u5FBD\u6807\uFF08\u5706\u70B9 + \u6587\u5B57\uFF1B\u7EFF=\u5DF2\u5B8C\u6210 \u9EC4=\u5F85\u529E/\u5F85\u53D1\u5E03 \u7070=\u672A\u5F00\u59CB\uFF09 */
-.dshell-badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l1, #262b36); font-size: 11.5px; color: var(--dsw-alias-label-secondary, #9aa4b2); background: var(--dsw-alias-fill-l1, rgba(255,255,255,.03)); }
-.dshell-badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-label-tertiary, #6b7280); }
-.dshell-badgeDone { color: #3fb950; border-color: rgba(63,185,80,.4); }
-.dshell-badgeDone::before { background: #3fb950; box-shadow: 0 0 5px #3fb950; }
-.dshell-badgeWait { color: #d29922; border-color: rgba(210,153,34,.4); }
-.dshell-badgeWait::before { background: #d29922; box-shadow: 0 0 5px #d29922; }
-.dshell-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-label-tertiary, #6b7280); }
-.dshell-dotDone { background: #3fb950; box-shadow: 0 0 5px #3fb950; }
-.dshell-dotWait { background: #d29922; box-shadow: 0 0 5px #d29922; }
-/* \u6807\u7B7E\u9875 */
-.dshell-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--dsw-alias-border-l1, #262b36); }
-.dshell-tab { padding: 7px 12px; font-size: 12.5px; color: var(--dsw-alias-label-secondary, #9aa4b2); cursor: pointer; border: none; background: none; font: inherit; border-bottom: 2px solid transparent; margin-bottom: -1px; }
-.dshell-tabOn { color: var(--dsw-alias-label-primary, #e6e8eb); border-bottom-color: var(--dsw-alias-state-accent-primary, #4f8ef7); }
-/* \u5217\u8868 */
-.dshell-list { display: flex; flex-direction: column; gap: 6px; }
-.dshell-listItem { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 8px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.02)); cursor: pointer; }
-.dshell-listItem:hover { border-color: var(--dsw-alias-border-l2, #3a4150); background: var(--dsw-alias-fill-l1, rgba(255,255,255,.05)); }
-.dshell-listItemTitle { font-size: 12.5px; color: var(--dsw-alias-label-primary, #e6e8eb); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dshell-listItemMeta { flex: none; font-size: 11px; color: var(--dsw-alias-label-tertiary, #6b7280); }
-/* \u7F51\u683C / \u7EDF\u8BA1 */
-.dshell-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
-.dshell-stat { padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 10px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.02)); }
-.dshell-statLabel { font-size: 11px; color: var(--dsw-alias-label-secondary, #9aa4b2); }
-.dshell-statValue { font-size: 20px; font-weight: 600; color: var(--dsw-alias-label-primary, #e6e8eb); }
-.dshell-statDelta { font-size: 11px; color: #3fb950; }
-/* \u8FDB\u5EA6\u6761 */
-.dshell-progress { height: 6px; border-radius: 3px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.06)); overflow: hidden; }
-.dshell-progressBar { height: 100%; border-radius: 3px; background: #3fb950; }
-/* \u8F93\u5165 */
-.dshell-input, .dshell-textarea { width: 100%; padding: 7px 10px; border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 8px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.03)); color: var(--dsw-alias-label-primary, #e6e8eb); font: inherit; font-size: 12.5px; outline: none; }
-.dshell-input:focus, .dshell-textarea:focus { border-color: var(--dsw-alias-state-accent-primary, #4f8ef7); }
-/* \u8868\u683C */
-.dshell-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.dshell-table th, .dshell-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--dsw-alias-border-l1, #262b36); }
-.dshell-table th { color: var(--dsw-alias-label-secondary, #9aa4b2); font-weight: 500; }
-/* \u952E\u503C\u5BF9 */
-.dshell-kv { display: flex; flex-direction: column; gap: 6px; }
-.dshell-kvRow { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
-.dshell-kvKey { color: var(--dsw-alias-label-secondary, #9aa4b2); }
-.dshell-kvValue { color: var(--dsw-alias-label-primary, #e6e8eb); text-align: right; }
-/* \u5206\u5272\u7EBF */
-.dshell-divider { height: 1px; background: var(--dsw-alias-border-l1, #262b36); margin: 6px 0; }
-/* \u6EDA\u52A8\u6761 */
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 5px; }
-::-webkit-scrollbar-track { background: transparent; }
+function memoryRootOf(projectFolder) {
+  return join(projectFolder, ...MEMORY_DIR.split("/"));
+}
+function renderSection(title, file, body, limit) {
+  const characters = [...body.trimEnd()];
+  const count = characters.length;
+  const percent = Math.round(count / limit * 100);
+  const header = `## ${title} (${file}) [${percent}% \u2014 ${count.toLocaleString("en-US")}/${limit.toLocaleString("en-US")} chars]`;
+  if (count <= limit) return `${header}
+
+${characters.join("")}`;
+  return `${header}
+
+${characters.slice(0, limit).join("")}
+
+[Truncated: ${file} has ${count.toLocaleString("en-US")} characters, over its ${limit.toLocaleString("en-US")}-character limit. Consolidate it below the limit; the full file is still on disk.]`;
+}
+function renderStandingPrompt(root, limits = { ...DEFAULT_STANDING_LIMITS }) {
+  const sections = [];
+  const soul = readBody(root, SOUL_FILE);
+  if (soul !== void 0 && soul.trim().length > 0) sections.push(renderSection("Soul", SOUL_FILE, soul, limits.soul));
+  const core = readBody(root, CORE_MEMORY_FILE);
+  if (core !== void 0 && core.trim().length > 0) sections.push(renderSection("Core Memory", CORE_MEMORY_FILE, core, limits.coreMemory));
+  return sections.join("\n\n");
+}
+function findProjectRoot(cwd) {
+  let dir = pathResolve(cwd);
+  const start = dir;
+  for (let i = 0; i < 24; i++) {
+    if (existsSync(join(dir, ".git"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return start;
+}
+var MEM_IDENTITY = ["-c", "user.name=dsh-worktable", "-c", "user.email=worktable@dsh.local"];
+function git(root, args) {
+  return execFileSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+}
+function configured(root, key) {
+  try {
+    return git(root, ["config", "--get", key]).trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+function identityFallback(root) {
+  return [
+    ...configured(root, "user.name") ? [] : ["-c", "user.name=dsh-worktable"],
+    ...configured(root, "user.email") ? [] : ["-c", "user.email=worktable@dsh.local"]
+  ];
+}
+function ensureMemoryRepository(root) {
+  try {
+    mkdirSync(root, { recursive: true });
+    if (!existsSync(join(root, ".git"))) {
+      git(root, ["init", "--quiet"]);
+      writeFileSync(join(root, ".gitignore"), ".DS_Store\nThumbs.db\n*.tmp\n", "utf8");
+      git(root, ["add", ".gitignore"]);
+      git(root, [...MEM_IDENTITY, "commit", "--no-gpg-sign", "--quiet", "-m", "Initialize memory repository"]);
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, code: "git-unavailable", message: err instanceof Error ? err.message : String(err) };
+  }
+}
+function atomicWrite(target, content) {
+  const tmp = target + ".tmp";
+  writeFileSync(tmp, content, "utf8");
+  renameSync(tmp, target);
+}
+function commitMemory(root, summary, source = "human") {
+  const lines = [summary, ""];
+  if (source === "human") lines.push("source=human");
+  git(root, ["add", "-A"]);
+  git(root, [...identityFallback(root), "commit", "--no-gpg-sign", "--quiet", "-m", lines.join("\n").trimEnd() + "\n", "--allow-empty"]);
+  try {
+    return git(root, ["rev-parse", "--short", "HEAD"]).trim();
+  } catch {
+    return "";
+  }
+}
+function writeMemoryFile(root, file, content, summary) {
+  ensureMemoryRepository(root);
+  const target = join(root, file);
+  mkdirSync(dirname(target), { recursive: true });
+  atomicWrite(target, content.endsWith("\n") ? content : content + "\n");
+  return commitMemory(root, summary, "human");
+}
+function memoryHistory(root, limit = 30) {
+  try {
+    const out = git(root, ["log", "--pretty=format:%h%x1f%H%x1f%ad%x1f%s", "--date=short", "-" + String(Math.max(1, Math.min(100, limit)))]);
+    return out.split("\n").filter(Boolean).map((line) => {
+      const [short, sha, date, ...rest] = line.split("");
+      return { short, sha, date, message: rest.join("") };
+    });
+  } catch {
+    return [];
+  }
+}
+function memoryDirty(root) {
+  try {
+    return git(root, ["status", "--porcelain"]).trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+function restoreMemory(root, sha) {
+  try {
+    ensureMemoryRepository(root);
+    if (memoryDirty(root)) commitMemory(root, "Save changes before restore");
+    git(root, ["checkout", "--quiet", sha, "--", "."]);
+    git(root, [...identityFallback(root), "commit", "--no-gpg-sign", "--quiet", "-m", `Restore memory to ${sha.slice(0, 7)}`, "--allow-empty"]);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// template/dshell.css
+var dshell_default = `/* dsh-worktable \u539F\u751F\u76AE\u80A4 \xB7 DSH \u8BBE\u8BA1\u7CFB\u7EDF\u7EC4\u4EF6\u5E93\r
+   \u7528\u6CD5\uFF1A<link rel="stylesheet" href="/api/worktable/template/dshell.css">\r
+   \u6240\u6709\u989C\u8272\u8D70 DSH \u4E3B\u9898\u53D8\u91CF\uFF08--dsw-alias-*\uFF09\uFF0C\u81EA\u52A8\u9002\u914D\u660E\u6697\u4E3B\u9898\u3002 */\r
+:root { color-scheme: dark; }\r
+* { box-sizing: border-box; }\r
+html, body { margin: 0; padding: 0; }\r
+body {\r
+  background: var(--dsw-alias-bg-base, #0b0e14);\r
+  color: var(--dsw-alias-label-primary, #e6e8eb);\r
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;\r
+  font-size: 13px;\r
+  line-height: 1.6;\r
+}\r
+.dshell { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; min-height: 100%; }\r
+/* \u6587\u5B57\u5C42\u7EA7 */\r
+.dshell-title { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #e6e8eb); }\r
+.dshell-sub { margin: 0; font-size: 12px; color: var(--dsw-alias-label-secondary, #9aa4b2); }\r
+.dshell-muted { color: var(--dsw-alias-label-tertiary, #6b7280); font-size: 11.5px; }\r
+/* \u5361\u7247 */\r
+.dshell-card { border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 10px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.02)); padding: 12px 14px; }\r
+.dshell-card + .dshell-card { margin-top: 10px; }\r
+/* \u6309\u94AE\uFF08\u7EFF\u8272\u4E3B\u6309\u94AE / \u5E7D\u7075\u6309\u94AE / \u5371\u9669\uFF09 */\r
+.dshell-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 999px; border: 1px solid transparent; background: #3fb950; color: #0b0e14; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }\r
+.dshell-btn:hover { filter: brightness(1.08); }\r
+.dshell-btnGhost { background: transparent; border-color: var(--dsw-alias-border-l1, #262b36); color: var(--dsw-alias-label-secondary, #9aa4b2); }\r
+.dshell-btnGhost:hover { color: var(--dsw-alias-label-primary, #e6e8eb); border-color: var(--dsw-alias-border-l2, #3a4150); }\r
+.dshell-btnDanger { background: transparent; border-color: #f85149; color: #f85149; }\r
+/* \u72B6\u6001\u5FBD\u6807\uFF08\u5706\u70B9 + \u6587\u5B57\uFF1B\u7EFF=\u5DF2\u5B8C\u6210 \u9EC4=\u5F85\u529E/\u5F85\u53D1\u5E03 \u7070=\u672A\u5F00\u59CB\uFF09 */\r
+.dshell-badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l1, #262b36); font-size: 11.5px; color: var(--dsw-alias-label-secondary, #9aa4b2); background: var(--dsw-alias-fill-l1, rgba(255,255,255,.03)); }\r
+.dshell-badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-label-tertiary, #6b7280); }\r
+.dshell-badgeDone { color: #3fb950; border-color: rgba(63,185,80,.4); }\r
+.dshell-badgeDone::before { background: #3fb950; box-shadow: 0 0 5px #3fb950; }\r
+.dshell-badgeWait { color: #d29922; border-color: rgba(210,153,34,.4); }\r
+.dshell-badgeWait::before { background: #d29922; box-shadow: 0 0 5px #d29922; }\r
+.dshell-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-label-tertiary, #6b7280); }\r
+.dshell-dotDone { background: #3fb950; box-shadow: 0 0 5px #3fb950; }\r
+.dshell-dotWait { background: #d29922; box-shadow: 0 0 5px #d29922; }\r
+/* \u6807\u7B7E\u9875 */\r
+.dshell-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--dsw-alias-border-l1, #262b36); }\r
+.dshell-tab { padding: 7px 12px; font-size: 12.5px; color: var(--dsw-alias-label-secondary, #9aa4b2); cursor: pointer; border: none; background: none; font: inherit; border-bottom: 2px solid transparent; margin-bottom: -1px; }\r
+.dshell-tabOn { color: var(--dsw-alias-label-primary, #e6e8eb); border-bottom-color: var(--dsw-alias-state-accent-primary, #4f8ef7); }\r
+/* \u5217\u8868 */\r
+.dshell-list { display: flex; flex-direction: column; gap: 6px; }\r
+.dshell-listItem { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 8px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.02)); cursor: pointer; }\r
+.dshell-listItem:hover { border-color: var(--dsw-alias-border-l2, #3a4150); background: var(--dsw-alias-fill-l1, rgba(255,255,255,.05)); }\r
+.dshell-listItemTitle { font-size: 12.5px; color: var(--dsw-alias-label-primary, #e6e8eb); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\r
+.dshell-listItemMeta { flex: none; font-size: 11px; color: var(--dsw-alias-label-tertiary, #6b7280); }\r
+/* \u7F51\u683C / \u7EDF\u8BA1 */\r
+.dshell-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }\r
+.dshell-stat { padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 10px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.02)); }\r
+.dshell-statLabel { font-size: 11px; color: var(--dsw-alias-label-secondary, #9aa4b2); }\r
+.dshell-statValue { font-size: 20px; font-weight: 600; color: var(--dsw-alias-label-primary, #e6e8eb); }\r
+.dshell-statDelta { font-size: 11px; color: #3fb950; }\r
+/* \u8FDB\u5EA6\u6761 */\r
+.dshell-progress { height: 6px; border-radius: 3px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.06)); overflow: hidden; }\r
+.dshell-progressBar { height: 100%; border-radius: 3px; background: #3fb950; }\r
+/* \u8F93\u5165 */\r
+.dshell-input, .dshell-textarea { width: 100%; padding: 7px 10px; border: 1px solid var(--dsw-alias-border-l1, #262b36); border-radius: 8px; background: var(--dsw-alias-fill-l1, rgba(255,255,255,.03)); color: var(--dsw-alias-label-primary, #e6e8eb); font: inherit; font-size: 12.5px; outline: none; }\r
+.dshell-input:focus, .dshell-textarea:focus { border-color: var(--dsw-alias-state-accent-primary, #4f8ef7); }\r
+/* \u8868\u683C */\r
+.dshell-table { width: 100%; border-collapse: collapse; font-size: 12px; }\r
+.dshell-table th, .dshell-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--dsw-alias-border-l1, #262b36); }\r
+.dshell-table th { color: var(--dsw-alias-label-secondary, #9aa4b2); font-weight: 500; }\r
+/* \u952E\u503C\u5BF9 */\r
+.dshell-kv { display: flex; flex-direction: column; gap: 6px; }\r
+.dshell-kvRow { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }\r
+.dshell-kvKey { color: var(--dsw-alias-label-secondary, #9aa4b2); }\r
+.dshell-kvValue { color: var(--dsw-alias-label-primary, #e6e8eb); text-align: right; }\r
+/* \u5206\u5272\u7EBF */\r
+.dshell-divider { height: 1px; background: var(--dsw-alias-border-l1, #262b36); margin: 6px 0; }\r
+/* \u6EDA\u52A8\u6761 */\r
+::-webkit-scrollbar { width: 10px; height: 10px; }\r
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,.14); border-radius: 5px; }\r
+::-webkit-scrollbar-track { background: transparent; }\r
 `;
 
 // template/dshell.html
-var dshell_default2 = '<!doctype html>\n<!-- dsh-worktable \u539F\u751F\u76AE\u80A4\u6A21\u677F\uFF1A\u65B0\u9875\u9762\u4EE5\u6B64\u4E3A\u57FA\u7840\uFF0C\u66FF\u6362\u4E0B\u9762\u793A\u4F8B\u5185\u5BB9\u5373\u53EF\u3002\n     \u6837\u5F0F\u8868\u7531\u63D2\u4EF6\u63D0\u4F9B\uFF08\u968F\u4E3B\u9898\u81EA\u52A8\u9002\u914D\uFF09\uFF0C\u4E0D\u8981\u590D\u5236\u6216\u6539\u5199\u5B83\u3002 -->\n<html lang="zh-CN">\n<head>\n  <meta charset="utf-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1" />\n  <title>\u6211\u7684\u7A97\u53E3</title>\n  <link rel="stylesheet" href="/api/worktable/template/dshell.css" />\n</head>\n<body>\n  <div class="dshell">\n    <!-- \u6807\u9898\u533A -->\n    <h1 class="dshell-title">\u7A97\u53E3\u6807\u9898</h1>\n    <p class="dshell-sub">\u4E00\u53E5\u8BDD\u8BF4\u660E\u8FD9\u4E2A\u7A97\u53E3\u505A\u4EC0\u4E48\u3002</p>\n\n    <!-- \u72B6\u6001\u5FBD\u6807\uFF1A\u5DF2\u5B8C\u6210 dshell-badgeDone / \u8FDB\u884C\u4E2D dshell-badgeWait / \u9ED8\u8BA4 -->\n    <div>\n      <span class="dshell-badge dshell-badgeDone">\u5DF2\u5B8C\u6210</span>\n      <span class="dshell-badge dshell-badgeWait">\u8FDB\u884C\u4E2D</span>\n      <span class="dshell-badge">\u672A\u5F00\u59CB</span>\n    </div>\n\n    <!-- \u6807\u7B7E\u9875 -->\n    <div class="dshell-tabs">\n      <button class="dshell-tab dshell-tabOn">\u6982\u89C8</button>\n      <button class="dshell-tab">\u8BE6\u60C5</button>\n      <button class="dshell-tab">\u8BBE\u7F6E</button>\n    </div>\n\n    <!-- \u7EDF\u8BA1\u5361\u7247\u7F51\u683C -->\n    <div class="dshell-grid">\n      <div class="dshell-stat">\n        <div class="dshell-statLabel">\u603B\u6570</div>\n        <div class="dshell-statValue">128</div>\n        <div class="dshell-statDelta">+12.4%</div>\n      </div>\n      <div class="dshell-stat">\n        <div class="dshell-statLabel">\u8FDB\u884C\u4E2D</div>\n        <div class="dshell-statValue">7</div>\n      </div>\n      <div class="dshell-stat">\n        <div class="dshell-statLabel">\u5DF2\u5B8C\u6210</div>\n        <div class="dshell-statValue">121</div>\n      </div>\n    </div>\n\n    <!-- \u5217\u8868 -->\n    <div class="dshell-list">\n      <div class="dshell-listItem">\n        <span class="dshell-listItemTitle">\u6761\u76EE\u4E00\uFF1A\u793A\u4F8B\u5185\u5BB9\u6807\u9898</span>\n        <span class="dshell-listItemMeta">\u6628\u5929</span>\n      </div>\n      <div class="dshell-listItem">\n        <span class="dshell-listItemTitle">\u6761\u76EE\u4E8C\uFF1A\u793A\u4F8B\u5185\u5BB9\u6807\u9898</span>\n        <span class="dshell-badge dshell-badgeDone">\u5DF2\u53D1\u5E03</span>\n      </div>\n    </div>\n\n    <!-- \u5361\u7247 + \u952E\u503C\u5BF9 -->\n    <div class="dshell-card">\n      <h2 class="dshell-sub" style="margin:0 0 8px">\u8BE6\u60C5</h2>\n      <div class="dshell-kv">\n        <div class="dshell-kvRow"><span class="dshell-kvKey">\u5B57\u6BB5 A</span><span class="dshell-kvValue">\u503C A</span></div>\n        <div class="dshell-kvRow"><span class="dshell-kvKey">\u5B57\u6BB5 B</span><span class="dshell-kvValue">\u503C B</span></div>\n      </div>\n      <div class="dshell-divider"></div>\n      <div class="dshell-progress"><div class="dshell-progressBar" style="width:72%"></div></div>\n    </div>\n\n    <!-- \u64CD\u4F5C\u533A -->\n    <div style="display:flex;gap:8px">\n      <button class="dshell-btn">\u4E3B\u8981\u64CD\u4F5C</button>\n      <button class="dshell-btn dshell-btnGhost">\u6B21\u8981\u64CD\u4F5C</button>\n    </div>\n  </div>\n</body>\n</html>\n';
+var dshell_default2 = '<!doctype html>\r\n<!-- dsh-worktable \u539F\u751F\u76AE\u80A4\u6A21\u677F\uFF1A\u65B0\u9875\u9762\u4EE5\u6B64\u4E3A\u57FA\u7840\uFF0C\u66FF\u6362\u4E0B\u9762\u793A\u4F8B\u5185\u5BB9\u5373\u53EF\u3002\r\n     \u6837\u5F0F\u8868\u7531\u63D2\u4EF6\u63D0\u4F9B\uFF08\u968F\u4E3B\u9898\u81EA\u52A8\u9002\u914D\uFF09\uFF0C\u4E0D\u8981\u590D\u5236\u6216\u6539\u5199\u5B83\u3002 -->\r\n<html lang="zh-CN">\r\n<head>\r\n  <meta charset="utf-8" />\r\n  <meta name="viewport" content="width=device-width, initial-scale=1" />\r\n  <title>\u6211\u7684\u7A97\u53E3</title>\r\n  <link rel="stylesheet" href="/api/worktable/template/dshell.css" />\r\n</head>\r\n<body>\r\n  <div class="dshell">\r\n    <!-- \u6807\u9898\u533A -->\r\n    <h1 class="dshell-title">\u7A97\u53E3\u6807\u9898</h1>\r\n    <p class="dshell-sub">\u4E00\u53E5\u8BDD\u8BF4\u660E\u8FD9\u4E2A\u7A97\u53E3\u505A\u4EC0\u4E48\u3002</p>\r\n\r\n    <!-- \u72B6\u6001\u5FBD\u6807\uFF1A\u5DF2\u5B8C\u6210 dshell-badgeDone / \u8FDB\u884C\u4E2D dshell-badgeWait / \u9ED8\u8BA4 -->\r\n    <div>\r\n      <span class="dshell-badge dshell-badgeDone">\u5DF2\u5B8C\u6210</span>\r\n      <span class="dshell-badge dshell-badgeWait">\u8FDB\u884C\u4E2D</span>\r\n      <span class="dshell-badge">\u672A\u5F00\u59CB</span>\r\n    </div>\r\n\r\n    <!-- \u6807\u7B7E\u9875 -->\r\n    <div class="dshell-tabs">\r\n      <button class="dshell-tab dshell-tabOn">\u6982\u89C8</button>\r\n      <button class="dshell-tab">\u8BE6\u60C5</button>\r\n      <button class="dshell-tab">\u8BBE\u7F6E</button>\r\n    </div>\r\n\r\n    <!-- \u7EDF\u8BA1\u5361\u7247\u7F51\u683C -->\r\n    <div class="dshell-grid">\r\n      <div class="dshell-stat">\r\n        <div class="dshell-statLabel">\u603B\u6570</div>\r\n        <div class="dshell-statValue">128</div>\r\n        <div class="dshell-statDelta">+12.4%</div>\r\n      </div>\r\n      <div class="dshell-stat">\r\n        <div class="dshell-statLabel">\u8FDB\u884C\u4E2D</div>\r\n        <div class="dshell-statValue">7</div>\r\n      </div>\r\n      <div class="dshell-stat">\r\n        <div class="dshell-statLabel">\u5DF2\u5B8C\u6210</div>\r\n        <div class="dshell-statValue">121</div>\r\n      </div>\r\n    </div>\r\n\r\n    <!-- \u5217\u8868 -->\r\n    <div class="dshell-list">\r\n      <div class="dshell-listItem">\r\n        <span class="dshell-listItemTitle">\u6761\u76EE\u4E00\uFF1A\u793A\u4F8B\u5185\u5BB9\u6807\u9898</span>\r\n        <span class="dshell-listItemMeta">\u6628\u5929</span>\r\n      </div>\r\n      <div class="dshell-listItem">\r\n        <span class="dshell-listItemTitle">\u6761\u76EE\u4E8C\uFF1A\u793A\u4F8B\u5185\u5BB9\u6807\u9898</span>\r\n        <span class="dshell-badge dshell-badgeDone">\u5DF2\u53D1\u5E03</span>\r\n      </div>\r\n    </div>\r\n\r\n    <!-- \u5361\u7247 + \u952E\u503C\u5BF9 -->\r\n    <div class="dshell-card">\r\n      <h2 class="dshell-sub" style="margin:0 0 8px">\u8BE6\u60C5</h2>\r\n      <div class="dshell-kv">\r\n        <div class="dshell-kvRow"><span class="dshell-kvKey">\u5B57\u6BB5 A</span><span class="dshell-kvValue">\u503C A</span></div>\r\n        <div class="dshell-kvRow"><span class="dshell-kvKey">\u5B57\u6BB5 B</span><span class="dshell-kvValue">\u503C B</span></div>\r\n      </div>\r\n      <div class="dshell-divider"></div>\r\n      <div class="dshell-progress"><div class="dshell-progressBar" style="width:72%"></div></div>\r\n    </div>\r\n\r\n    <!-- \u64CD\u4F5C\u533A -->\r\n    <div style="display:flex;gap:8px">\r\n      <button class="dshell-btn">\u4E3B\u8981\u64CD\u4F5C</button>\r\n      <button class="dshell-btn dshell-btnGhost">\u6B21\u8981\u64CD\u4F5C</button>\r\n    </div>\r\n  </div>\r\n</body>\r\n</html>\r\n';
 
 // src/index.ts
 function baseDshHome() {
   const env = process.env.DSH_HOME;
-  const value = env !== void 0 && env.trim().length > 0 ? env : pathResolve(homedir(), ".dsh");
+  const value = env !== void 0 && env.trim().length > 0 ? env : pathResolve2(homedir(), ".dsh");
   if (value === "~") return homedir();
-  if (value.startsWith("~/") || value.startsWith("~\\")) return pathResolve(homedir(), value.slice(2));
-  return pathResolve(value);
+  if (value.startsWith("~/") || value.startsWith("~\\")) return pathResolve2(homedir(), value.slice(2));
+  return pathResolve2(value);
 }
 var cachedDshHome = null;
 var dshHomeSource = "fallback";
@@ -157,33 +299,33 @@ var loadProbeAttempts = 0;
 function loadPkg(pkg) {
   const starts = /* @__PURE__ */ new Set();
   try {
-    starts.add(dirname(fileURLToPath(import.meta.url)));
+    starts.add(dirname2(fileURLToPath(import.meta.url)));
   } catch {
   }
   try {
-    starts.add(realpathSync(dirname(fileURLToPath(import.meta.url))));
+    starts.add(realpathSync(dirname2(fileURLToPath(import.meta.url))));
   } catch {
   }
   for (const start of starts) {
     let dir = start;
-    while (dir && dir !== pathResolve(dir, "..")) {
+    while (dir && dir !== pathResolve2(dir, "..")) {
       loadProbeAttempts++;
       try {
-        const req = createRequire(pathToFileURL(pathResolve(dir, "__wt_probe__.js")).href);
+        const req = createRequire(pathToFileURL(pathResolve2(dir, "__wt_probe__.js")).href);
         return req(pkg);
       } catch {
       }
-      dir = pathResolve(dir, "..");
+      dir = pathResolve2(dir, "..");
     }
   }
   try {
-    const profilesDir = pathResolve(baseDshHome(), "profiles");
+    const profilesDir = pathResolve2(baseDshHome(), "profiles");
     for (const profile of readdirSync(profilesDir, { withFileTypes: true })) {
       if (!profile.isDirectory() && !profile.isSymbolicLink()) continue;
-      const nm = pathResolve(profilesDir, profile.name, "node_modules");
+      const nm = pathResolve2(profilesDir, profile.name, "node_modules");
       loadProbeAttempts++;
       try {
-        const req = createRequire(pathToFileURL(pathResolve(nm, "__wt_probe__.js")).href);
+        const req = createRequire(pathToFileURL(pathResolve2(nm, "__wt_probe__.js")).href);
         return req(pkg);
       } catch {
       }
@@ -210,6 +352,51 @@ function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(body));
 }
+var MEMORY_SECTION = "worktable:project-memory";
+var MEMORY_ORDER = 2400;
+function promptCwdOf(context) {
+  const c = context ?? {};
+  const candidates = [
+    c.agent?.session?.header?.cwd,
+    c.session?.header?.cwd,
+    c.agent?.cwd,
+    c.cwd,
+    c.workingDirectory,
+    c.agent?.workingDirectory
+  ];
+  for (const v of candidates) if (typeof v === "string" && v.trim() !== "") return v;
+  return "";
+}
+function setupStandingMemory(ctx) {
+  let systemPrompt = null;
+  try {
+    systemPrompt = ctx.get?.("systemPrompt") ?? ctx.systemPrompt;
+  } catch {
+  }
+  if (!systemPrompt || typeof systemPrompt.section !== "function") {
+    ctx.logger?.info?.("[dsh-worktable] \u5BBF\u4E3B\u65E0 systemPrompt \u670D\u52A1\uFF0C\u8DF3\u8FC7\u5E38\u9A7B\u8BB0\u5FC6\u6CE8\u5165");
+    return;
+  }
+  try {
+    systemPrompt.section({
+      name: MEMORY_SECTION,
+      order: MEMORY_ORDER,
+      interpolate: false,
+      text: (context) => {
+        const cwd = promptCwdOf(context);
+        if (!cwd) return "";
+        try {
+          const root = findProjectRoot(cwd);
+          return renderStandingPrompt(memoryRootOf(root), { ...DEFAULT_STANDING_LIMITS });
+        } catch {
+          return "";
+        }
+      }
+    });
+  } catch (err) {
+    ctx.logger?.warn?.("[dsh-worktable] \u6CE8\u518C\u5E38\u9A7B\u8BB0\u5FC6 section \u5931\u8D25\uFF1A" + String(err));
+  }
+}
 async function readJsonBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
@@ -222,7 +409,7 @@ async function readJsonBody(req) {
   }
 }
 async function listDirectory(path) {
-  const abs = pathResolve(path);
+  const abs = pathResolve2(path);
   const dirents = await readdir(abs, { withFileTypes: true });
   const entries = dirents.map((d) => ({ name: d.name, path: abs + sep + d.name, isDir: d.isDirectory(), hidden: d.name.startsWith(".") })).sort((a, b) => {
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
@@ -330,6 +517,7 @@ function apply(ctx) {
     ctx.logger?.warn("[dsh-worktable] ctx.webServer \u4E0D\u53EF\u7528\uFF08headless profile\uFF1F\uFF09\uFF0C\u8DF3\u8FC7\u670D\u52A1\u7AEF\u8DEF\u7531");
     return;
   }
+  setupStandingMemory(ctx);
   webServer.register({
     kind: "exact",
     path: HEALTH_PATH,
@@ -348,7 +536,7 @@ function apply(ctx) {
           json(res, 400, { error: "missing path" });
           return;
         }
-        const abs = pathResolve(p);
+        const abs = pathResolve2(p);
         const stat = await import("node:fs/promises").then((m) => m.stat(abs));
         if (stat.size > 20 * 1024 * 1024) {
           json(res, 413, { error: "file too large" });
@@ -433,8 +621,8 @@ function apply(ctx) {
           json(res, 400, { error: "missing root" });
           return;
         }
-        const root = pathResolve(rootToken);
-        let abs = pathResolve(root, rel);
+        const root = pathResolve2(rootToken);
+        let abs = pathResolve2(root, rel);
         if (abs !== root && !abs.startsWith(root + sep)) {
           json(res, 403, { error: "outside root" });
           return;
@@ -442,7 +630,7 @@ function apply(ctx) {
         const statMod = await import("node:fs/promises");
         let info = await statMod.stat(abs).catch(() => null);
         if (info && info.isDirectory()) {
-          abs = pathResolve(abs, "index.html");
+          abs = pathResolve2(abs, "index.html");
           info = await statMod.stat(abs).catch(() => null);
         }
         if (!info || !info.isFile()) {
@@ -516,7 +704,7 @@ function apply(ctx) {
           });
           return;
         }
-        const file = pathResolve(resolveDshHomeSafe(), "storages", "workspace.json");
+        const file = pathResolve2(resolveDshHomeSafe(), "storages", "workspace.json");
         const raw = await readFile(file, "utf8");
         json(res, 200, JSON.parse(raw.charCodeAt(0) === 65279 ? raw.slice(1) : raw));
       } catch (err) {
@@ -545,7 +733,7 @@ function apply(ctx) {
           json(res, 413, { error: "content too large" });
           return;
         }
-        const abs = pathResolve(p);
+        const abs = pathResolve2(p);
         await import("node:fs/promises").then((m) => m.writeFile(abs, content, "utf8"));
         json(res, 200, { ok: true });
       } catch (err) {
@@ -569,9 +757,9 @@ function apply(ctx) {
           json(res, 400, { error: "missing path" });
           return;
         }
-        const abs = pathResolve(p);
+        const abs = pathResolve2(p);
         const fsx = await import("node:fs/promises");
-        const parent = dirname(abs);
+        const parent = dirname2(abs);
         try {
           await fsx.access(parent);
         } catch {
@@ -582,6 +770,180 @@ function apply(ctx) {
         json(res, 200, { ok: true, path: abs });
       } catch (err) {
         json(res, err?.code === "EEXIST" ? 200 : 500, err?.code === "EEXIST" ? { ok: true, exists: true } : { error: String(err) });
+      }
+    }
+  });
+  webServer.register({
+    kind: "exact",
+    path: "/api/worktable/memory/save",
+    handler: async (req, res) => {
+      try {
+        if (req.method !== "POST") {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+        const body = await readJsonBody(req);
+        const root = typeof body.root === "string" ? body.root : "";
+        const file = typeof body.file === "string" ? body.file : "";
+        const content = typeof body.content === "string" ? body.content : "";
+        if (!root || !file) {
+          json(res, 400, { error: "missing root or file" });
+          return;
+        }
+        if (!/^[A-Za-z0-9._-]+\.(md|markdown)$/i.test(file)) {
+          json(res, 400, { error: "file must be a single .md name" });
+          return;
+        }
+        const absRoot = pathResolve2(root);
+        const abs = pathResolve2(absRoot, file);
+        if (absRoot !== pathResolve2(abs, "..")) {
+          json(res, 400, { error: "outside memory root" });
+          return;
+        }
+        const sha = writeMemoryFile(absRoot, file, content, body.summary && typeof body.summary === "string" ? body.summary : "Update " + file);
+        json(res, 200, { ok: true, commit: sha });
+      } catch (err) {
+        json(res, 500, { error: String(err) });
+      }
+    }
+  });
+  webServer.register({
+    kind: "exact",
+    path: "/api/worktable/memory/history",
+    handler: async (req, res) => {
+      try {
+        const u = new URL(req.url ?? "/", "http://dsh.internal");
+        const root = u.searchParams.get("root") || "";
+        if (!root) {
+          json(res, 400, { error: "missing root" });
+          return;
+        }
+        const absRoot = pathResolve2(root);
+        json(res, 200, { ok: true, commits: memoryHistory(absRoot), dirty: memoryDirty(absRoot) });
+      } catch (err) {
+        json(res, 500, { error: String(err) });
+      }
+    }
+  });
+  webServer.register({
+    kind: "exact",
+    path: "/api/worktable/memory/restore",
+    handler: async (req, res) => {
+      try {
+        if (req.method !== "POST") {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+        const body = await readJsonBody(req);
+        const root = typeof body.root === "string" ? body.root : "";
+        const sha = typeof body.sha === "string" ? body.sha : "";
+        if (!root || !sha) {
+          json(res, 400, { error: "missing root or sha" });
+          return;
+        }
+        const out = restoreMemory(pathResolve2(root), sha);
+        if (!out.ok) {
+          json(res, 400, { error: out.error ?? "restore failed" });
+          return;
+        }
+        json(res, 200, { ok: true });
+      } catch (err) {
+        json(res, 500, { error: String(err) });
+      }
+    }
+  });
+  webServer.register({
+    kind: "exact",
+    path: "/api/worktable/diary",
+    handler: async (req, res) => {
+      try {
+        if (req.method !== "POST") {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+        const body = await readJsonBody(req);
+        const repo = typeof body.repo === "string" ? body.repo : "";
+        const who = typeof body.who === "string" ? body.who.trim() : "";
+        const text = typeof body.text === "string" ? body.text.trim() : "";
+        if (!repo || !who || !text) {
+          json(res, 400, { error: "missing repo / who / text" });
+          return;
+        }
+        if (text.length > 8e3) {
+          json(res, 400, { error: "text too long" });
+          return;
+        }
+        const abs = pathResolve2(repo);
+        const fsx = await import("node:fs/promises");
+        try {
+          await fsx.access(pathResolve2(abs, ".git"));
+        } catch {
+          json(res, 400, { error: "\u4E0D\u662F git \u4ED3\u5E93\uFF1A" + abs });
+          return;
+        }
+        const d = /* @__PURE__ */ new Date();
+        const day = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+        const hhmm = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+        const rel = "diary/" + day + ".md";
+        const file = pathResolve2(abs, ...rel.split("/"));
+        if (!file.startsWith(abs + sep)) {
+          json(res, 400, { error: "path escape" });
+          return;
+        }
+        try {
+          await gitExec(["pull", "--rebase", "--autostash"], abs);
+        } catch {
+        }
+        let old = "";
+        try {
+          old = await fsx.readFile(file, "utf8");
+        } catch {
+          old = "# " + day + "\n";
+        }
+        const entry = "\n## " + hhmm + " " + who + "\n\n" + text.split("\n").map((l) => "- " + l).join("\n") + "\n";
+        await fsx.writeFile(file, (old.endsWith("\n") ? old : old + "\n") + entry, "utf8");
+        await gitExec(["add", "--", rel], abs);
+        await gitExec(["-c", "user.name=dsh", "-c", "user.email=dsh@fleet.local", "commit", "--no-gpg-sign", "--quiet", "-m", "\u65E5\u8BB0 " + day + " " + who], abs);
+        let pushed = false;
+        try {
+          await gitExec(["push", "--quiet", "origin", "HEAD"], abs);
+          pushed = true;
+        } catch {
+        }
+        json(res, 200, { ok: true, file: rel, pushed });
+      } catch (err) {
+        json(res, 500, { error: String(err) });
+      }
+    }
+  });
+  webServer.register({
+    kind: "exact",
+    path: "/api/worktable/delete",
+    handler: async (req, res) => {
+      try {
+        if (req.method !== "POST") {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+        const body = await readJsonBody(req);
+        const p = typeof body.path === "string" ? body.path : "";
+        if (!p) {
+          json(res, 400, { error: "missing path" });
+          return;
+        }
+        if (!/\.(md|markdown)$/i.test(p)) {
+          json(res, 400, { error: "only .md files can be deleted here" });
+          return;
+        }
+        const abs = pathResolve2(p);
+        await import("node:fs/promises").then((m) => m.unlink(abs));
+        json(res, 200, { ok: true });
+      } catch (err) {
+        json(res, 500, { error: String(err) });
       }
     }
   });

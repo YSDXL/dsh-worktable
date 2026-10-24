@@ -1,9 +1,11 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
-import { parentPathOf } from './pathutil'
+import { parentPathOf, joinPath } from './pathutil'
 import { hostWebSocketUrl, worktableUpgrade } from './hostTransport'
 import { CHANGELOG_V030 } from './changelog'
 import { LOCAL_VERSION, checkUpdate, getAutoCheck, readCache, setAutoCheck as storeAutoCheck, setSkipVersion, type UpdateInfo, type UpdateStatus } from './updateCheck'
-import { Terminal } from 'xterm'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import { WebglAddon } from '@xterm/addon-webgl'
 
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js/lib/core'
@@ -118,6 +120,10 @@ type SplitState = {
   /** 锁定窗格：清空原有标签，把内容作为该窗唯一的固定标签（挂载产物的「锁死」语义） */
   lockPane(row: PaneRow, i: number, content: SplitContent): void
   closeTab(row: PaneRow, i: number, tabId: string): void
+  /** 布局随时修改：在指定行右侧/下方拆出一个新窗格（标签对半搬过去），返回新下标 */
+  splitPane(row: PaneRow, i: number, dir: 'right' | 'down'): number
+  /** 布局随时修改：关闭指定窗格（标签先搬去邻居，不丢内容）；最后一个窗格拒绝 */
+  closePane(row: PaneRow, i: number): boolean
   setActiveTab(row: PaneRow, i: number, tabId: string): void
   toggleCollapsed(row: PaneRow, i: number): void
   moveTab(fromRow: PaneRow, fromI: number, tabId: string, toRow: PaneRow, toI: number): void
@@ -133,6 +139,8 @@ const GAP = 1           // 窗格之间真实布局间隙：1px（分隔细线�
 const DIVIDER = 4       // 分隔条热区宽度：透明覆盖层，细线画在热区中间与两侧内容贴齐
 const BAR_H = 26
 const PERSIST_KEY = 'dsh.worktable.split.v2'
+/** 单行最多窗格数（布局随时修改的上限；超出拒绝拆分） */
+const MAX_PANES_PER_ROW = 6
 
 /** 内置内容窗图标 */
 const BUILTIN_ICONS: Record<BuiltinType, string> = {
@@ -227,6 +235,8 @@ type SplitEnv = {
   getScope: () => SplitScope | null
   getJobs: () => SplitJob[]
   getSubagents: () => any[]
+  /** 该项目绑定的会话是否正在运行（用于保活判定：运行中的工作台不回收） */
+  isProjectRunning?: (projectId: string) => boolean
   /** 自定义窗口：项目列表 + 会话列表 + 当前项目 + 新建会话 / 发送到已有会话 */
   custom?: {
     getProjects: () => { id: string; name: string }[]
@@ -239,6 +249,10 @@ type SplitEnv = {
   console?: {
     subscribe: (fn: () => void) => () => void
     getCards: () => ConsoleCardData[]
+    /** 当前项目文件夹（项目记忆面板用；空 = 未设置） */
+    getProjectFolder?: () => string
+    /** 当前项目显示名（项目记忆面板标题用） */
+    getProjectName?: () => string
     onOpen: (id: string) => void
     onJump: (id: string) => void
     /** 点发光卡片：确认（熄灭光）再打开 */
@@ -314,6 +328,26 @@ function setDropTarget(t: { row: PaneRow; index: number } | null) {
   for (const fn of dropTargetListeners) fn()
 }
 
+/** 拖标签后吞掉紧随的那次 click（借鉴 DSH-P「标签交互」①）：
+ *  HTML5 DnD 的 dragend 之后浏览器仍会派发一次 click，落到原标签上就会
+ *  「拖完标签顺带把它设为激活」——本意只是挪位置的那一下变成了切换。
+ * 做法：dragend 时打标，click 在 capture 阶段被拦掉，500ms 后自动解标。 */
+const tabDragMoved = { current: false }
+let tabClickSuppressUntil = 0
+let tabClickSuppressTimer: number | null = null
+function suppressTabClick() {
+  tabClickSuppressUntil = Date.now() + 500
+  if (tabClickSuppressTimer != null) window.clearTimeout(tabClickSuppressTimer)
+  tabClickSuppressTimer = window.setTimeout(() => {
+    tabClickSuppressTimer = null
+    tabClickSuppressUntil = 0
+  }, 500)
+}
+/** 当前是否处于「拖拽后吞 click」窗口（供 onClick 判定） */
+function tabClickSuppressed(): boolean {
+  return Date.now() < tabClickSuppressUntil
+}
+
 /** ——「指哪打哪」标注引擎：按钮 → 蓝色冒泡光标 → 点击弹输入框 → ✓ 打包进对话框（不发送） —— */
 type AnnotState = {
   on: boolean
@@ -338,6 +372,12 @@ function setAnnot(patch: Partial<AnnotState>) {
   for (const fn of annotListeners) fn()
 }
 function subscribeAnnot(fn: () => void) { annotListeners.add(fn); return () => { annotListeners.delete(fn) } }
+
+/** 窗格右键菜单：位置 + 目标窗格（模块级；WorkspaceLayer 渲染一次，fixed 定位） */
+let ctxMenu: { x: number; y: number; row: PaneRow; index: number } | null = null
+const ctxListeners = new Set<() => void>()
+function setCtxMenu(v: { x: number; y: number; row: PaneRow; index: number } | null) { ctxMenu = v; for (const fn of ctxListeners) fn() }
+function subscribeCtx(fn: () => void) { ctxListeners.add(fn); return () => { ctxListeners.delete(fn) } }
 
 /** 进入瞄准模式（resp = 窗口编号等上下文，由调用方拼好） */
 function startAnnot(resp: string) {
@@ -576,10 +616,34 @@ function AnnotationOverlay() {
           stat += '，窗口内 (' + rx1 + '%,' + ry1 + '%)→(' + rx2 + '%,' + ry2 + '%)'
         }
         const hit = boxPayload(L, T, R, B)
-        if (hit.primary) stat += '，主目标：' + hit.primary.text + '（字号 ' + hit.primary.fontSize + '，行高 ' + hit.primary.lineHeight + '）'
-        if (hit.line) stat += '；整行：' + hit.line
-        if (hit.limited) stat += '；读取受限：跨域页面内容不可见（浏览器安全限制），窗口身份见上（' + (hit.src ? hit.src : '无URL') + '）'
-        if (hit.candidates.length > 0) stat += '；候选：' + hit.candidates.map((t, i) => '[' + (i + 1) + ']' + t).join(' ')
+        // 浏览器窗：点/框落在内嵌 iframe（跨域页面）上时，DOM 读不到，只给网页区域 + URL，
+        // 且绝不再把本插件窗框（↻/✕/↗）误当"主目标"。
+        let onIframe: HTMLIFrameElement | null = null
+        if (paneEl) {
+          try {
+            const ccx = (L + R) / 2, ccy = (T + B) / 2
+            onIframe = Array.from(paneEl.querySelectorAll('iframe')).find((f) => {
+              const r = f.getBoundingClientRect()
+              return r.width > 0 && r.height > 0 && ccx >= r.left && ccx <= r.right && ccy >= r.top && ccy <= r.bottom
+            }) as HTMLIFrameElement | undefined ?? null
+          } catch {}
+        }
+        if (onIframe) {
+          const ir = onIframe.getBoundingClientRect()
+          let host = '页面'
+          try { host = new URL(onIframe.getAttribute('src') || '', location.href).hostname || '页面' } catch {}
+          const rx1 = (((L - ir.left) / Math.max(1, ir.width)) * 100).toFixed(1)
+          const ry1 = (((T - ir.top) / Math.max(1, ir.height)) * 100).toFixed(1)
+          const rx2 = (((R - ir.left) / Math.max(1, ir.width)) * 100).toFixed(1)
+          const ry2 = (((B - ir.top) / Math.max(1, ir.height)) * 100).toFixed(1)
+          stat += '，网页「' + host + '」内区域 (' + rx1 + '%,' + ry1 + '%)→(' + rx2 + '%,' + ry2 + '%)'
+          stat += '；跨域页面 DOM 不可读取（浏览器安全限制），只能按区域描述，窗口身份见上（' + (onIframe.getAttribute('src') || '无URL') + '）'
+        } else {
+          if (hit.primary) stat += '，主目标：' + hit.primary.text + '（字号 ' + hit.primary.fontSize + '，行高 ' + hit.primary.lineHeight + '）'
+          if (hit.line) stat += '；整行：' + hit.line
+          if (hit.limited) stat += '；读取受限：跨域页面内容不可见（浏览器安全限制），窗口身份见上（' + (hit.src ? hit.src : '无URL') + '）'
+          if (hit.candidates.length > 0) stat += '；候选：' + hit.candidates.map((t, i) => '[' + (i + 1) + ']' + t).join(' ')
+        }
       } else {
         stat = '屏幕坐标 (' + Math.round(e.clientX) + ', ' + Math.round(e.clientY) + ')'
         if (paneEl) {
@@ -765,11 +829,8 @@ export const splitStore: SplitState = {
 
   open(spec) {
     if (this.active) {
-      // 反选：同一布局再点 = 关闭；不同布局 = 替换（先关旧的）
-      if (this.spec?.id === spec.id) {
-        this.close()
-        return true
-      }
+      // 同一布局再点 = 保持打开（不关闭、不重建，避免闪烁/卡顿）；不同布局 = 替换（先关旧的）
+      if (this.spec?.id === spec.id) return true
       this.close()
     }
     // 跨插件互操作桥：自带分栏实现的入驻插件（未接入共享引擎）打开时，运行时点击其关闭按钮让位
@@ -782,8 +843,10 @@ export const splitStore: SplitState = {
       window.dispatchEvent(new CustomEvent('dsh:split-claim', { detail: { id: spec.id } }))
     } catch {}
     const root = findConversationRoot()
-    if (!root) return false
-    const { header, viewArea } = resolveAnchor(root)
+    // DOM 里没有会话根（无头/测试/会话未挂载）时仍要能打开布局：
+    // 布局结构与增删窗格不依赖 DOM，只有锚点挂载需要它 —— 缺失就跳过挂载，不返回 false。
+    const anchor = root ? resolveAnchor(root) : null
+    const { header, viewArea } = anchor ?? { header: null, viewArea: null }
     this.spec = { ...spec, chatSide: spec.chatSide === 'left' ? 'left' : 'right' }
     // 向后兼容归一化：单内容声明 → 一个标签页
     const normalize = (p: SplitPane): SplitPane => {
@@ -815,10 +878,11 @@ export const splitStore: SplitState = {
     this.root = root
     this.header = header
     this.viewArea = viewArea
-    this.savedWidthVar = root.style.getPropertyValue('--dsh-chat-user-width')
-    this.savedMarginLeft = viewArea.style.marginLeft
-    this.savedMarginRight = viewArea.style.marginRight
-    this.savedMarginTop = viewArea.style.marginTop
+    // 无 DOM 锚点时没有可保存的原值（close 也不该恢复）—— 存空串即可
+    this.savedWidthVar = root ? root.style.getPropertyValue('--dsh-chat-user-width') : ''
+    this.savedMarginLeft = viewArea ? viewArea.style.marginLeft : ''
+    this.savedMarginRight = viewArea ? viewArea.style.marginRight : ''
+    this.savedMarginTop = viewArea ? viewArea.style.marginTop : ''
     this.refreshGeom()
     // 存档 sanitize：chatW 等尺寸按本布局规格钳制（防老版本/脏存值越界，如 1067 > max 600）
     if (this.geom) {
@@ -1210,14 +1274,69 @@ export const splitStore: SplitState = {
     this.notify()
   },
 
-  setActiveTab(row, i, tabId) {
+  /** 拆分窗格（VSCode 语义）：在指定行新增一个窗格，原窗格的标签从激活标签起对半搬过去。
+   *  'right' = 同一行右侧插入；'down' = 挤到下一行（main 行内拆分时把后面的窗格整体后移）。
+   *  返回新窗格下标；不改变标签内容本身（不复制、不新建）。 */
+  splitPane(row: PaneRow, i: number, dir: 'right' | 'down'): number {
     const spec = this.spec
-    if (!spec) return
-    const mutate = (pane: SplitPane): SplitPane => {
-      const idx = (pane.tabs ?? []).findIndex((t) => t.id === tabId)
-      if (idx < 0) return pane
-      return { ...pane, active: idx }
+    if (!spec) return -1
+    if (row === 'left') return -1            // 左列是整高单窗，不支持拆分
+    const top = [...(spec.top ?? [])]
+    const main = [...spec.main]
+    const arr = row === 'top' ? top : main
+    const src = arr[i]
+    if (!src) return -1
+    if (arr.length >= MAX_PANES_PER_ROW) return -1   // 上限 6：再宽就没法用了
+    const tabs = src.tabs ?? []
+    const active = src.active ?? 0
+    // 从激活标签起对半：前一半留原窗，后一半去新窗。
+    // 只有 0/1 个标签时原窗全留、新窗为空（不能把唯一标签搬走 —— 那等于「搬窗」不是「拆分」）。
+    const cut = tabs.length > 1 ? Math.ceil(tabs.length / 2) : tabs.length
+    const kept = tabs.slice(0, cut)
+    const moved = tabs.slice(cut)
+    const id = 'p' + Date.now().toString(36)
+    const born: SplitPane = { id, title: paneTitleFor(arr, i), min: 200, tabs: moved, active: moved.length > 0 ? 0 : undefined }
+    arr.splice(i + 1, 0, born)
+    const patched: SplitPane = { ...src, tabs: kept, active: kept.length > 0 ? Math.min(active, kept.length - 1) : undefined }
+    arr[i] = patched
+    this.spec = row === 'top' ? { ...spec, top } : { ...spec, main }
+    this.onSpecMutated?.(this.spec)
+    this.persist()
+    this.notify()
+    return i + 1
+  },
+
+  /** 关闭窗格：先把它的标签整体搬到邻居窗格（不丢内容），再移除自身。
+   *  至少保留一个内容窗；没有邻居可搬时把标签留在原窗（等价于只关闭拆分出来的新窗）。 */
+  closePane(row: PaneRow, i: number): boolean {
+    const spec = this.spec
+    if (!spec) return false
+    if (row === 'left') return false
+    const top = [...(spec.top ?? [])]
+    const main = [...spec.main]
+    const arr = row === 'top' ? top : main
+    if (arr.length <= 1) return false        // 最后一个窗格不许关（关了就什么都没有）
+    const doomed = arr[i]
+    if (!doomed) return false
+    // 邻居优先级：右侧 → 左侧 → 任意存活窗格
+    let target = i + 1 < arr.length ? i + 1 : i - 1 >= 0 ? i - 1 : -1
+    if (target < 0) return false
+    const tabs = doomed.tabs ?? []
+    if (tabs.length > 0) {
+      const dst = arr[target]
+      const merged = [...(dst.tabs ?? []), ...tabs]
+      arr[target] = { ...dst, tabs: merged, active: merged.length - 1 }
+      this.onPaneContentEdited?.(spec.id, dst.id)
     }
+    arr.splice(i, 1)
+    this.spec = row === 'top' ? { ...spec, top } : { ...spec, main }
+    this.onSpecMutated?.(this.spec)
+    this.persist()
+    this.notify()
+    return true
+  },
+
+  setActiveTab(row, i, tabId) {
     if (row === 'left') {
       if (!spec.left || i !== 0) return
       this.spec = { ...spec, left: mutate(spec.left) }
@@ -1429,7 +1548,15 @@ function BrowserPane(props: { row: PaneRow; index: number; tabId: string; conten
         />
         <button type="button" className="dsh-wt_browserGo" onClick={go}>↗</button>
       </div>
-      <iframe key={props.reloadKey} className="dsh-wt_paneFrame" src={src} title="browser" />
+      {src === 'about:blank' ? (
+        // 空态：地址不合法时明确说原因 + 下一步，不留白屏
+        <div className="dsh-wt_paneWip">
+          <span className="dsh-wt_paneWipIcon" aria-hidden>🌐</span>
+          <span className="dsh-wt_paneWipText">{T('pane.browserBlank')}</span>
+        </div>
+      ) : (
+        <iframe key={props.reloadKey} className="dsh-wt_paneFrame" src={src} title="browser" />
+      )}
     </>
   )
 }
@@ -1622,6 +1749,27 @@ function ConsolePane() {
   const [glowGrid, setGlowGridState] = useState<number>(() => splitEnv?.console?.getGlowGrid?.() ?? 8)
   const [glowSpeed, setGlowSpeedState] = useState<number>(() => splitEnv?.console?.getGlowSpeed?.() ?? 50)
   const [annOpen, setAnnOpen] = useState(false)
+  const [memOpen, setMemOpen] = useState(false)
+  /** 编队日记：向 knowledge 仓 diary/ 追加一条（服务端 pull→append→commit→push） */
+  const [diaryOpen, setDiaryOpen] = useState(false)
+  const [diaryRepo, setDiaryRepo] = useState<string>(() => { try { return localStorage.getItem('dsh.worktable.diaryRepo.v1') ?? '' } catch { return '' } })
+  const [diaryWho, setDiaryWho] = useState<string>(() => { try { return localStorage.getItem('dsh.worktable.diaryWho.v1') ?? 'dsh' } catch { return 'dsh' } })
+  const [diaryText, setDiaryText] = useState('')
+  const [diaryBusy, setDiaryBusy] = useState(false)
+  const [diaryMsg, setDiaryMsg] = useState('')
+  const sendDiary = async () => {
+    const repo = diaryRepo.trim(); const text = diaryText.trim()
+    if (!repo || !text || !diaryWho.trim()) { setDiaryMsg(T('diary.needFields')); return }
+    setDiaryBusy(true); setDiaryMsg('')
+    try {
+      try { localStorage.setItem('dsh.worktable.diaryRepo.v1', repo); localStorage.setItem('dsh.worktable.diaryWho.v1', diaryWho.trim()) } catch {}
+      const r = await fetch('/api/worktable/diary', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ repo, who: diaryWho.trim(), text }) })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok || !d?.ok) throw new Error(d?.error ?? 'HTTP ' + r.status)
+      setDiaryText('')
+      setDiaryMsg(d.pushed ? T('diary.pushed', { file: String(d.file ?? '') }) : T('diary.localOnly', { file: String(d.file ?? '') }))
+    } catch (e: any) { setDiaryMsg(String(e?.message ?? e)) } finally { setDiaryBusy(false) }
+  }
   const [updStatus, setUpdStatus] = useState<UpdateStatus>(() => readCache().status)
   const [updInfo, setUpdInfo] = useState<UpdateInfo | null>(() => readCache().info)
   const [autoCheckOn, setAutoCheckOn] = useState<boolean>(() => getAutoCheck())
@@ -1960,9 +2108,12 @@ function ConsolePane() {
   }, [photoId])
   // 面板卸载时释放对象 URL
   useEffect(() => () => { if (photoUrlRef.current) { try { URL.revokeObjectURL(photoUrlRef.current) } catch {} } }, [])
-  // 运行时长的分钟级刷新：每秒重渲染一次（仅控制室开着时存在）
+  // 运行时长的分钟级刷新：每秒重渲染一次；仅当控制室窗可见时才刷新（隐藏的保活工作区不重渲染，减少切项目卡顿）
   useEffect(() => {
-    const iv = window.setInterval(() => setNow(Date.now()), 1000)
+    const iv = window.setInterval(() => {
+      const g = gridRef.current
+      if (g && g.offsetWidth > 0 && g.offsetHeight > 0) setNow(Date.now())
+    }, 1000)
     return () => window.clearInterval(iv)
   }, [])
   void now
@@ -2016,7 +2167,34 @@ function ConsolePane() {
         {bg === 'glow' && (<><i className="dsh-wt_blob dsh-wt_blob1" /><i className="dsh-wt_blob dsh-wt_blob2" /><i className="dsh-wt_blob dsh-wt_blob3" /><i className="dsh-wt_blob dsh-wt_blob4" /></>)}</span>
       {openMenu !== null && <div className="dsh-wt_dropMask" onClick={() => setOpenMenu(null)} />}
       <div className="dsh-wt_consoleScroll">
-        {annOpen ? (
+        {memOpen ? (
+          <MemoryPanel
+            folder={env?.getProjectFolder?.() ?? ''}
+            projectName={env?.getProjectName?.() ?? T('console.name')}
+            onClose={() => setMemOpen(false)}
+          />
+        ) : diaryOpen ? (
+          <div className="dsh-wt_announceCtr">
+            <div className="dsh-wt_announce dsh-wt_diaryCtr">
+              <div className="dsh-wt_announceHead">
+                <span className="dsh-wt_announceVer">📔 {T('diary.title')}</span>
+                <button type="button" className="dsh-wt_memClose" onClick={() => setDiaryOpen(false)} aria-label={T('mem.cancel')}>✕</button>
+              </div>
+              <div className="dsh-wt_customRow">
+                <span className="dsh-wt_customLabel">{T('diary.repo')}</span>
+                <input className="dsh-wt_customPathInput" placeholder="F:\\AI\\工作区\\knowledge" value={diaryRepo} onChange={(e) => { setDiaryRepo(e.target.value); setDiaryMsg('') }} />
+              </div>
+              <div className="dsh-wt_customRow">
+                <span className="dsh-wt_customLabel">{T('diary.who')}</span>
+                <input className="dsh-wt_customPathInput" style={{ maxWidth: 160 }} value={diaryWho} onChange={(e) => setDiaryWho(e.target.value)} />
+              </div>
+              <textarea className="dsh-wt_diaryText" placeholder={T('diary.ph')} value={diaryText} onChange={(e) => { setDiaryText(e.target.value); setDiaryMsg('') }} rows={6} />
+              <button type="button" className="dsh-wt_customSend" disabled={diaryBusy || !diaryRepo.trim() || !diaryText.trim() || !diaryWho.trim()} onClick={() => void sendDiary()}>{diaryBusy ? '…' : T('diary.send')}</button>
+              {diaryMsg && <p className="dsh-wt_diaryMsg">{diaryMsg}</p>}
+              <p className="dsh-wt_memHint">{T('diary.hint')}</p>
+            </div>
+          </div>
+        ) : annOpen ? (
           <div className="dsh-wt_announceCtr">
           <div className="dsh-wt_announce">
             <div className="dsh-wt_announceHead">
@@ -2094,7 +2272,9 @@ function ConsolePane() {
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'shape' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.shapeLabel')} aria-label={T('console.shapeLabel')} onClick={() => setOpenMenu(openMenu === 'shape' ? null : 'shape')}><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="2.2" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" strokeWidth="0.9" /><circle cx="10.6" cy="10.6" r="3.8" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'bg' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.bgLabel')} aria-label={T('console.bgLabel')} onClick={() => { setOpenMenu(openMenu === 'bg' ? null : 'bg'); setBgEdit(null) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.6" fill="none" stroke="currentColor" strokeWidth="0.9" /><circle cx="5.9" cy="6.7" r="1.05" fill="none" stroke="currentColor" strokeWidth="0.8" /><path d="M3.4 11.4l3-3 2.3 2.3 1.9-1.9 3 2.6" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
           <button type="button" className={'dsh-wt_dockBtn' + (openMenu === 'cols' ? ' dsh-wt_dockBtnOn' : '')} title={T('console.colsLabel')} aria-label={T('console.colsLabel')} onClick={() => setOpenMenu(openMenu === 'cols' ? null : 'cols')}><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden><rect x="2.2" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="6.65" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /><rect x="11.1" y="3.4" width="2.7" height="9.2" rx="0.9" fill="none" stroke="currentColor" strokeWidth="0.9" /></svg></button>
-          <button type="button" className={'dsh-wt_dockBtn' + (annOpen ? ' dsh-wt_dockBtnOn' : '')} title={T('annot.updateTitle')} aria-label={T('annot.updateTitle')} onClick={() => { setOpenMenu(null); setAnnOpen((v) => !v) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><path d="M2.6 7c0-2.9 2.4-4.9 5.4-4.9s5.4 2 5.4 4.9v2.9l1.2 1.7H1.4l1.2-1.7z" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinejoin="round" /><path d="M6.2 12.9c.3.7 1 1.2 1.8 1.2s1.5-.5 1.8-1.2" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" /></svg>{updInfo && <span className="dsh-wt_dockBadge" aria-hidden />}</button>
+          <button type="button" className={'dsh-wt_dockBtn' + (memOpen ? ' dsh-wt_dockBtnOn' : '')} title={T('mem.title')} aria-label={T('mem.title')} onClick={() => { setOpenMenu(null); setAnnOpen(false); setMemOpen((v) => !v) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><path d="M8 2.2c2.6 0 4.4 1.9 4.4 4.3 0 2.1-1.4 3.2-2.6 3.7-.5.2-.7.5-.7 1v.5H6.9v-.5c0-.5-.2-.8-.7-1C5 9.7 3.6 8.6 3.6 6.5 3.6 4.1 5.4 2.2 8 2.2Z" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinejoin="round" /><path d="M6.9 13.1h2.2" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" /></svg></button>
+          <button type="button" className={'dsh-wt_dockBtn' + (diaryOpen ? ' dsh-wt_dockBtnOn' : '')} title={T('diary.title')} aria-label={T('diary.title')} onClick={() => { setOpenMenu(null); setAnnOpen(false); setMemOpen(false); setDiaryOpen((v) => !v) }}><span style={{ fontSize: 15, lineHeight: '18px' }} aria-hidden>📔</span></button>
+          <button type="button" className={'dsh-wt_dockBtn' + (annOpen ? ' dsh-wt_dockBtnOn' : '')} title={T('annot.updateTitle')} aria-label={T('annot.updateTitle')} onClick={() => { setOpenMenu(null); setMemOpen(false); setAnnOpen((v) => !v) }}><svg width="18" height="18" viewBox="0 0 16 16" aria-hidden><path d="M2.6 7c0-2.9 2.4-4.9 5.4-4.9s5.4 2 5.4 4.9v2.9l1.2 1.7H1.4l1.2-1.7z" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinejoin="round" /><path d="M6.2 12.9c.3.7 1 1.2 1.8 1.2s1.5-.5 1.8-1.2" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" /></svg>{updInfo && <span className="dsh-wt_dockBadge" aria-hidden />}</button>
         </div>
         {openMenu === 'theme' && (
           <div className="dsh-wt_drop">
@@ -2410,19 +2590,36 @@ function TerminalPane() {
     let term: any = null
     let ws: WebSocket | null = null
     let disposed = false
+    let fit: FitAddon | null = null
     try {
       term = new Terminal({
         cursorBlink: true,
         fontFamily: 'Cascadia Code, Cascadia Mono, Consolas, Menlo, monospace',
         fontSize: 12,
-        convertEol: true,
         theme: { background: '#010409' },
       })
+      // 尺寸贴合必须走 addon：xterm 实例上没有 fit 方法。
+      // （曾经用 typeof 守卫守一个不存在的方法，守卫恒假 → 尺寸永远是连接时的 80×24）
+      fit = new FitAddon()
+      term.loadAddon(fit)
+      // GPU 渲染器：大量输出时不再掉帧。加载失败（无 WebGL）静默回落默认渲染器；
+      // 运行中丢上下文时释放该 addon 同样回落，避免终端整片变空白
+      try {
+        const webgl = new WebglAddon()
+        webgl.onContextLoss(() => { try { webgl.dispose() } catch {} })
+        term.loadAddon(webgl)
+      } catch {}
     } catch {
       setFailed(T('pane.termFail'))
       return
     }
     term.open(el)
+    const refit = (): boolean => {
+      if (!fit) return false
+      try { fit.fit(); return true } catch { return false }
+    }
+    // fit 必须在 open 之后：open 之前没有可测的尺寸
+    refit()
     // 强制自动换行（DECAWM on）：超长行在窗口宽度处换行，不被截断
     try { term.write('\x1b[?7h') } catch {}
     const focusTerm = () => { try { term.focus() } catch {} }
@@ -2430,27 +2627,54 @@ function TerminalPane() {
     el.addEventListener('pointerdown', focusTerm)
     const scope = splitEnv?.getScope?.()
     try {
-      const url = hostWebSocketUrl('/api/worktable/term?sessionId=' + encodeURIComponent(scope?.sessionId ?? '') + '&cwd=' + encodeURIComponent(scope?.cwd ?? '') + '&cols=80&rows=24')
+      // 尺寸取 fit 后的真实 cols/rows：此前硬编码 80×24，终端永远不知道窗格有多宽
+      const url = hostWebSocketUrl('/api/worktable/term?sessionId=' + encodeURIComponent(scope?.sessionId ?? '') + '&cwd=' + encodeURIComponent(scope?.cwd ?? '') + '&cols=' + term.cols + '&rows=' + term.rows)
       ws = new WebSocket(url)
     } catch {
       term.dispose()
       setFailed(T('pane.termFail'))
       return
     }
-    ws.onopen = () => { focusTerm(); try { term.write('\x1b[?7h') } catch {} }
+    const pushSize = () => {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
+    }
+    ws.onopen = () => { focusTerm(); refit(); pushSize(); try { term.write('\x1b[?7h') } catch {} }
     ws.onmessage = (ev) => { try { term.write(String(ev.data)) } catch {} }
     ws.onclose = () => { if (!disposed) { try { term.write('\r\n[连接已关闭]') } catch {} } }
     ws.onerror = () => { if (!disposed) setFailed(T('pane.termFail')) }
     term.onData((d: string) => { if (ws && ws.readyState === 1) ws.send(d) })
-    const ro = new ResizeObserver(() => {
-      if (typeof term.fit === 'function') {
-        try { term.fit() } catch {}
-        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
-      }
-    })
+    const ro = new ResizeObserver(() => { if (refit()) pushSize() })
     ro.observe(el)
+    // ── 剪贴板：xterm 自己不碰系统剪贴板，复制/粘贴必须显式接线 ──
+    const copySel = async (): Promise<boolean> => {
+      const sel = term.getSelection()
+      if (!sel) return false
+      try { await navigator.clipboard.writeText(sel); return true } catch { return false }
+    }
+    const pasteClip = async () => {
+      try { const t = await navigator.clipboard.readText(); if (t) term.paste(t) } catch {}
+    }
+    // Ctrl+C 仍发给 pty 做中断，复制走 Ctrl+Shift+C（Windows Terminal 的约定）
+    term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+      if (e.type !== 'keydown' || !(e.ctrlKey || e.metaKey) || !e.shiftKey) return true
+      const k = (e.key || '').toLowerCase()
+      if (k === 'c') { void copySel(); return false }
+      if (k === 'v') { void pasteClip(); return false }
+      return true
+    })
+    // 终端里的右键归终端：有选中 → 复制，无选中 → 粘贴。
+    // 就地掐断冒泡 —— 窗格那层 onContextMenu 挂在 React 根上，不掐断就会在终端里弹出窗格菜单
+    // （标题栏 / 标签栏上的右键不受影响，仍可开窗格菜单）
+    const onCtx = (e: MouseEvent) => {
+      e.preventDefault()
+      e.stopPropagation()
+      if (term.hasSelection()) void copySel()
+      else void pasteClip()
+    }
+    el.addEventListener('contextmenu', onCtx)
     return () => {
       disposed = true
+      el.removeEventListener('contextmenu', onCtx)
       ro.disconnect()
       try { ws?.close() } catch {}
       try { term.dispose() } catch {}
@@ -2467,7 +2691,288 @@ const mdRenderer = new MarkdownIt({ linkify: true })
 const IMAGE_EXTS = /[.](png|jpe?g|gif|webp|svg|bmp|ico)$/i
 const MD_EXTS = /[.](md|markdown|mdown)$/i
 
-/** 本地文件预览：PDF 走原生 iframe（Chrome 内置阅读器）、图片居中、MD 渲染、其余纯文本 */
+/** 项目记忆面板（对齐 BotHarness soul.ts）：
+ *  两个常驻文件 SOUL.md（我是谁）/ MEMORY.md（记忆索引）真正注入 system prompt，
+ *  各带字符上限（超限只截断注入内容，磁盘文件不动），标题带用量百分比；
+ *  其他 .md 是详情文件，不自动注入，供 MEMORY.md 索引 + 需要时阅读。 */
+const MEM_LIMITS = { soul: 5000, coreMemory: 3000 }
+const MEM_MIN = 500
+const MEM_MAX = 50000
+const MEM_LIMIT_KEY = 'dsh.worktable.memLimits.v1'
+
+function memLimitsLoad(): { soul: number; coreMemory: number } {
+  try {
+    const raw = localStorage.getItem(MEM_LIMIT_KEY)
+    if (!raw) return { ...MEM_LIMITS }
+    const p = JSON.parse(raw)
+    const ok = (v: any) => typeof v === 'number' && Number.isInteger(v) && v >= MEM_MIN && v <= MEM_MAX
+    return { soul: ok(p?.soul) ? p.soul : MEM_LIMITS.soul, coreMemory: ok(p?.coreMemory) ? p.coreMemory : MEM_LIMITS.coreMemory }
+  } catch { return { ...MEM_LIMITS } }
+}
+
+function MemoryPanel(props: { folder: string; projectName: string; onClose: () => void }) {
+  const folder = props.folder
+  // 显式空态：没绑文件夹时 SOUL/MEMORY 路径必然落空——静默空白最难排查（DSH-P：没数据不许一片白）
+  if (!folder) {
+    return (
+      <div className="dsh-wt_memPanel">
+        <div className="dsh-wt_memHead">
+          <span className="dsh-wt_memTitle">🧠 {T('mem.title')}</span>
+          <span className="dsh-wt_memProj">{props.projectName}</span>
+          <button type="button" className="dsh-wt_memClose" onClick={props.onClose} aria-label="close">✕</button>
+        </div>
+        <div className="dsh-wt_memBody">
+          <div className="dsh-wt_paneWip">
+            <span className="dsh-wt_paneWipIcon" aria-hidden>📂</span>
+            <span className="dsh-wt_paneWipText">{T('mem.noFolder')}</span>
+          </div>
+        </div>
+      </div>
+    )
+  }
+  const memRoot = joinPath(joinPath(folder, '.dsh-worktable'), 'memory')
+  const soulPath = joinPath(memRoot, 'SOUL.md')
+  const corePath = joinPath(memRoot, 'MEMORY.md')
+  const agentsPath = joinPath(folder, 'AGENTS.md')
+  const [sel, setSel] = useState<string>(soulPath)
+  const [text, setText] = useState('')
+  const [orig, setOrig] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+  const [saved, setSaved] = useState(false)
+  const [files, setFiles] = useState<{ name: string; path: string }[]>([])
+  const [newName, setNewName] = useState('')
+  const [limits, setLimits] = useState<{ soul: number; coreMemory: number }>(memLimitsLoad)
+  const [limitOpen, setLimitOpen] = useState(false)
+  const [limitDraft, setLimitDraft] = useState<{ soul: string; coreMemory: string }>({ soul: '', coreMemory: '' })
+  /** Git 历史面板：提交列表（最新在前）+ 恢复确认 */
+  const [histOpen, setHistOpen] = useState(false)
+  const [commits, setCommits] = useState<{ short: string; sha: string; message: string; date: string }[]>([])
+  const [histLoading, setHistLoading] = useState(false)
+  const [lastCommit, setLastCommit] = useState('')
+
+  const load = useCallback(async (path: string) => {
+    setLoading(true); setErr(''); setSaved(false)
+    try {
+      const r = await fetch('/api/worktable/file?path=' + encodeURIComponent(path), { cache: 'no-store' })
+      if (r.ok) { const t = await r.text(); setText(t); setOrig(t) }
+      else if (r.status === 404) {
+        // 不存在 = 空文件，可直接写；但把实际读取路径显示出来——
+        // 「面板说空但磁盘有文件」多半是路径解析错位，一行提示直接定位（防呆）
+        setText(''); setOrig('')
+        setErr(T('mem.notFound', { path }))
+      }
+      else throw new Error('HTTP ' + r.status)
+    } catch (e: any) { setErr(String(e?.message ?? e)) } finally { setLoading(false) }
+  }, [])
+
+  /** 列出记忆目录 + 项目根的 .md（排除 SOUL/MEMORY/AGENTS——它们各自有固定位置） */
+  const listFiles = useCallback(async () => {
+    const collect = async (dir: string) => {
+      try {
+        const d = await postJson('/api/worktable/fs', { path: dir })
+        return (d?.entries ?? []).filter((e: any) => e && !e.isDir && /\.(md|markdown)$/i.test(e.name))
+          .map((e: any) => ({ name: e.name, path: e.path }))
+      } catch { return [] as { name: string; path: string }[] }
+    }
+    const [mem, root] = await Promise.all([collect(memRoot), collect(folder)])
+    const skip = new Set(['SOUL.md', 'MEMORY.md', 'AGENTS.md'])
+    setFiles([...mem, ...root.filter((f) => !skip.has(f.name))])
+  }, [memRoot, folder])
+
+  useEffect(() => { void load(sel); void listFiles() }, [sel, load, listFiles])
+
+  const save = async () => {
+    setLoading(true); setErr(''); setSaved(false)
+    try {
+      const isStanding = sel === soulPath || sel === corePath || sel === agentsPath
+      if (isStanding) {
+        // 常驻文件走 memory/save：原子写 + git 自动提交
+        const file = sel === agentsPath ? 'AGENTS.md' : basenameOf(sel)
+        const root = sel === agentsPath ? folder : memRoot
+        const r = await fetch('/api/worktable/memory/save', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ root, file, content: text, summary: 'Update ' + file }) })
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok || !d?.ok) throw new Error(d?.error ?? 'HTTP ' + r.status)
+        setLastCommit(typeof d.commit === 'string' ? d.commit : '')
+      } else {
+        const r = await fetch('/api/worktable/write', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: sel, content: text }) })
+        if (!r.ok) throw new Error('HTTP ' + r.status)
+      }
+      setOrig(text); setSaved(true); void listFiles()
+    } catch (e: any) { setErr(String(e?.message ?? e)) } finally { setLoading(false) }
+  }
+
+  const create = async () => {
+    const name = newName.trim()
+    if (!name) return
+    if (!/\.(md|markdown)$/i.test(name) || /[\\/]/.test(name)) { setErr(T('mem.newPh')); return }
+    const path = joinPath(memRoot, name)
+    setLoading(true); setErr('')
+    try {
+      const r = await fetch('/api/worktable/write', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path, content: '# ' + name.replace(/\.md$/i, '') + '\n\n' }) })
+      if (!r.ok) throw new Error('HTTP ' + r.status)
+      setNewName(''); await listFiles(); setSel(path)
+    } catch (e: any) { setErr(String(e?.message ?? e)) } finally { setLoading(false) }
+  }
+
+  const del = async (path: string) => {
+    try {
+      const r = await fetch('/api/worktable/delete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path }) })
+      if (!r.ok) throw new Error('HTTP ' + r.status)
+      if (sel === path) setSel(soulPath)
+      void listFiles()
+    } catch (e: any) { setErr(String(e?.message ?? e)) }
+  }
+
+  /** 当前文件是否常驻（决定显示用量/上限） */
+  const roleOf = (path: string): { role: 'soul' | 'coreMemory' | 'agents' | 'detail'; label: string; limit: number; hint: string } | null => {
+    if (path === soulPath) return { role: 'soul', label: T('mem.soul'), limit: limits.soul, hint: T('mem.soulHint') }
+    if (path === corePath) return { role: 'coreMemory', label: T('mem.core'), limit: limits.coreMemory, hint: T('mem.coreHint') }
+    if (path === agentsPath) return { role: 'agents', label: T('mem.agents'), limit: 0, hint: T('mem.agentsHint') }
+    return { role: 'detail', label: T('mem.detail'), limit: 0, hint: T('mem.detailHint') }
+  }
+  const meta = roleOf(sel)
+
+  const dirty = text !== orig
+  const chars = [...text.trimEnd()].length
+  const over = !!meta && meta.limit > 0 && chars > meta.limit
+  const pct = meta && meta.limit > 0 ? Math.round((chars / meta.limit) * 100) : 0
+
+  const openLimitEditor = () => {
+    setLimitDraft({ soul: String(limits.soul), coreMemory: String(limits.coreMemory) })
+    setLimitOpen(true)
+  }
+  const openHistory = async () => {
+    setHistOpen(true); setHistLoading(true)
+    try {
+      const r = await fetch('/api/worktable/memory/history?root=' + encodeURIComponent(memRoot), { cache: 'no-store' })
+      const d = await r.json().catch(() => ({}))
+      setCommits(Array.isArray(d?.commits) ? d.commits : [])
+    } catch { setCommits([]) } finally { setHistLoading(false) }
+  }
+  const doRestore = async (sha: string) => {
+    if (!confirm(T('mem.restoreConfirm', { sha: sha.slice(0, 7) }))) return
+    try {
+      const r = await fetch('/api/worktable/memory/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ root: memRoot, sha }) })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok || !d?.ok) throw new Error(d?.error ?? 'HTTP ' + r.status)
+      await void load(sel); await openHistory()
+    } catch (e: any) { setErr(String(e?.message ?? e)) }
+  }
+  const saveLimits = () => {
+    const s = parseInt(limitDraft.soul, 10)
+    const c = parseInt(limitDraft.coreMemory, 10)
+    const clamp = (v: number, fb: number) => (Number.isInteger(v) && v >= MEM_MIN && v <= MEM_MAX ? v : fb)
+    const next = { soul: clamp(s, MEM_LIMITS.soul), coreMemory: clamp(c, MEM_LIMITS.coreMemory) }
+    setLimits(next)
+    try { localStorage.setItem(MEM_LIMIT_KEY, JSON.stringify(next)) } catch {}
+    setLimitOpen(false)
+  }
+
+  return (
+    <div className="dsh-wt_memPanel">
+      <div className="dsh-wt_memHead">
+        <span className="dsh-wt_memTitle">🧠 {T('mem.title')}</span>
+        <span className="dsh-wt_memProj" title={memRoot}>{props.projectName}</span>
+        <button type="button" className="dsh-wt_memClose" onClick={props.onClose} aria-label="close">✕</button>
+      </div>
+      <div className="dsh-wt_memBody">
+        <div className="dsh-wt_memSide">
+          <div className="dsh-wt_memSideLabel">{T('mem.standing')}</div>
+          <button type="button" className={'dsh-wt_memFile' + (sel === soulPath ? ' dsh-wt_memFileOn' : '')} onClick={() => setSel(soulPath)}>
+            <span aria-hidden>✦</span>{T('mem.soul')}
+          </button>
+          <button type="button" className={'dsh-wt_memFile' + (sel === corePath ? ' dsh-wt_memFileOn' : '')} onClick={() => setSel(corePath)}>
+            <span aria-hidden>✦</span>{T('mem.core')}
+          </button>
+          <button type="button" className={'dsh-wt_memFile' + (sel === agentsPath ? ' dsh-wt_memFileOn' : '')} onClick={() => setSel(agentsPath)}>
+            <span aria-hidden>📌</span>{T('mem.agents')}
+          </button>
+          <div className="dsh-wt_memSideLabel">{T('mem.files')}</div>
+          {files.length === 0 && <div className="dsh-wt_memEmpty">{T('mem.none')}</div>}
+          {files.map((f) => (
+            <div key={f.path} className={'dsh-wt_memRow' + (sel === f.path ? ' dsh-wt_memFileOn' : '')}>
+              <button type="button" className="dsh-wt_memFileName" onClick={() => setSel(f.path)} title={f.path}>{f.name}</button>
+              <button type="button" className="dsh-wt_memDel" title={T('mem.del')} onClick={() => void del(f.path)}>✕</button>
+            </div>
+          ))}
+          <div className="dsh-wt_memNewRow">
+            <input className="dsh-wt_memNewInput" placeholder={T('mem.newPh')} value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') void create() }} />
+            <button type="button" className="dsh-wt_memBtn" onClick={() => void create()}>{T('mem.new')}</button>
+          </div>
+          <button type="button" className="dsh-wt_memBtn dsh-wt_memLimitBtn" onClick={openLimitEditor}>⚙ {T('mem.limits')}</button>
+          <button type="button" className="dsh-wt_memBtn dsh-wt_memLimitBtn" onClick={() => void openHistory()}>⏱ {T('mem.history')}</button>
+        </div>
+        <div className="dsh-wt_memMain">
+          {meta && <p className="dsh-wt_memHint">{meta.hint}</p>}
+          {err && <p className="dsh-wt_addError">{err}</p>}
+          {over && <p className="dsh-wt_memOver">{T('mem.overLimit', { chars: chars.toLocaleString('en-US'), limit: meta!.limit.toLocaleString('en-US') })}</p>}
+          <textarea
+            className="dsh-wt_memEditor"
+            value={text}
+            spellCheck={false}
+            placeholder={T('mem.empty')}
+            onChange={(e) => { setText(e.target.value); setSaved(false) }}
+          />
+          <div className="dsh-wt_memFoot">
+            {meta && meta.limit > 0 ? (
+              <span className={'dsh-wt_memCount' + (over ? ' dsh-wt_memCountOver' : '')}>
+                [{pct}% — {chars.toLocaleString('en-US')}/{meta.limit.toLocaleString('en-US')} {T('mem.chars')}]
+              </span>
+            ) : (
+              <span className="dsh-wt_memCount">{chars.toLocaleString('en-US')} {T('mem.chars')}</span>
+            )}
+            <button type="button" className="dsh-wt_memBtn" onClick={() => void load(sel)} disabled={loading}>{T('mem.reload')}</button>
+            <button type="button" className="dsh-wt_memBtn dsh-wt_memSave" onClick={() => void save()} disabled={loading || !dirty}>
+              {saved && !dirty ? '✓ ' + T('mem.saved') + (lastCommit ? ' · ' + lastCommit : '') : T('mem.save')}
+            </button>
+          </div>
+        </div>
+      </div>
+      {histOpen && (
+        <div className="dsh-wt_memLimitPop">
+          <div className="dsh-wt_memHistHead">
+            <span>⏱ {T('mem.history')}</span>
+            <button type="button" className="dsh-wt_memClose" onClick={() => setHistOpen(false)} aria-label="close">✕</button>
+          </div>
+          {histLoading && <p className="dsh-wt_memHint">…</p>}
+          {!histLoading && commits.length === 0 && <p className="dsh-wt_memHint">{T('mem.histEmpty')}</p>}
+          <div className="dsh-wt_memHistList">
+            {commits.map((c) => (
+              <div key={c.sha} className="dsh-wt_memHistRow">
+                <span className="dsh-wt_memHistSha">{c.short}</span>
+                <span className="dsh-wt_memHistMsg" title={c.message}>{c.message}</span>
+                <span className="dsh-wt_memHistDate">{c.date}</span>
+                <button type="button" className="dsh-wt_memBtn" onClick={() => void doRestore(c.sha)}>{T('mem.restore')}</button>
+              </div>
+            ))}
+          </div>
+          <p className="dsh-wt_memHint">{T('mem.histHint')}</p>
+        </div>
+      )}
+      {limitOpen && (
+        <div className="dsh-wt_memLimitPop">
+          <div className="dsh-wt_memLimitRow">
+            <span>{T('mem.soul')}</span>
+            <input value={limitDraft.soul} onChange={(e) => setLimitDraft((d) => ({ ...d, soul: e.target.value }))} />
+          </div>
+          <div className="dsh-wt_memLimitRow">
+            <span>{T('mem.core')}</span>
+            <input value={limitDraft.coreMemory} onChange={(e) => setLimitDraft((d) => ({ ...d, coreMemory: e.target.value }))} />
+          </div>
+          <p className="dsh-wt_memHint">{T('mem.limitsHint', { min: String(MEM_MIN), max: String(MEM_MAX) })}</p>
+          <div className="dsh-wt_memLimitActs">
+            <button type="button" className="dsh-wt_memBtn" onClick={() => setLimitOpen(false)}>{T('mem.cancel')}</button>
+            <button type="button" className="dsh-wt_memBtn dsh-wt_memSave" onClick={saveLimits}>{T('mem.save')}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function FileViewer(props: { path: string }) {
   const ext = (props.path.split('.').pop() || '').toLowerCase()
   const fileUrl = '/api/worktable/file?path=' + encodeURIComponent(props.path)
@@ -2702,7 +3207,14 @@ function CustomPane(props: { paneTitle?: string; row?: PaneRow; index?: number }
     }
   }
   if (!custom) {
-    return <div className="dsh-wt_paneWip"><span className="dsh-wt_paneWipText">{T('pane.wip')}</span></div>
+    // 显式空态（借鉴 DSH-P「面板类型总览」：没数据时不许一片白）：
+    // 说清「为什么没有」+「下一步做什么」，而不是只写「开发中」。
+    return (
+      <div className="dsh-wt_paneWip">
+        <span className="dsh-wt_paneWipIcon" aria-hidden>{BUILTIN_ICONS.custom}</span>
+        <span className="dsh-wt_paneWipText">{T('custom.unavailable')}</span>
+      </div>
+    )
   }
   if (done) {
     return (
@@ -2872,9 +3384,9 @@ function PaneBody(props: { pane: SplitPane; row: PaneRow; index: number }) {
             className={'dsh-wt_tab' + (i === active ? ' dsh-wt_tabOn' : '')}
             title={t.title}
             draggable={!locked}
-            onDragStart={(e: any) => { dragTab = { row, index, tabId: t.id }; try { e.dataTransfer.effectAllowed = 'move' } catch {} }}
-            onDragEnd={() => { dragTab = null; setDropTarget(null) }}
-            onClick={() => splitStore.setActiveTab(row, index, t.id)}
+            onDragStart={(e: any) => { dragTab = { row, index, tabId: t.id }; tabDragMoved.current = false; try { e.dataTransfer.effectAllowed = 'move' } catch {} }}
+            onDragEnd={() => { dragTab = null; setDropTarget(null); if (tabDragMoved.current) suppressTabClick() }}
+            onClick={() => { if (tabClickSuppressed()) return; splitStore.setActiveTab(row, index, t.id) }}
           >
             {refreshableTab(t) && (
               <button
@@ -2899,7 +3411,21 @@ function PaneBody(props: { pane: SplitPane; row: PaneRow; index: number }) {
         })}
       </div>
       )}
-      <PaneTabBody tab={tabs[active]} row={row} index={index} paneTitle={pane.title} reloadKey={reloadKeys[tabs[active].id] ?? 0} />
+      {/* 标签页常驻：切换标签只切显隐，不卸载。
+          此前只渲染 tabs[active] —— 卸载 iframe 就是整页重载，对一个几百 KB JS 的站点
+          等于每次切回来都从头加载一遍，卡就卡在这。
+          代价（已知上限）：打开过的每个标签都留在内存里继续跑；标签特别多时吃内存。
+          真观测到内存问题再加懒加载/上限，现在不加。 */}
+      {tabs.map((t, i) => (
+        <div
+          key={t.id}
+          className="dsh-wt_tabBody"
+          data-tab-active={i === active ? 'true' : 'false'}
+          style={{ display: i === active ? 'flex' : 'none', flex: 1, minHeight: 0, flexDirection: 'column' }}
+        >
+          <PaneTabBody tab={t} row={row} index={index} paneTitle={pane.title} reloadKey={reloadKeys[t.id] ?? 0} />
+        </div>
+      ))}
     </>
   )
 }
@@ -2945,7 +3471,155 @@ function PanePicker(props: { row: PaneRow; index: number }) {
   )
 }
 
-type PoolItem = { spec: LayoutSpec; chatW: number; topH: number; leftW: number; paneWs: number[]; topWs: number[] }
+/** 窗格右键菜单：右键内容窗 → 在此窗口新建/添加各类窗口（标签页）、标注、关闭当前标签 */
+function CtxMenu() {
+  const [, setTick] = useState(0)
+  useEffect(() => subscribeCtx(() => setTick((t) => t + 1)), [])
+  useEffect(() => {
+    if (!ctxMenu) return
+    const close = (e?: Event) => {
+      const t = e && e.target instanceof Element ? e.target : null
+      if (t && t.closest('.dsh-wt_ctxMenu')) return
+      setCtxMenu(null)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setCtxMenu(null) }
+    window.addEventListener('mousedown', close, true)
+    window.addEventListener('keydown', onKey, true)
+    window.addEventListener('scroll', close, true)
+    return () => {
+      window.removeEventListener('mousedown', close, true)
+      window.removeEventListener('keydown', onKey, true)
+      window.removeEventListener('scroll', close, true)
+    }
+  }, [ctxMenu])
+  if (!ctxMenu) return null
+  const { row, index } = ctxMenu
+  const spec = splitStore.spec
+  const pane = row === 'left' ? spec?.left : row === 'top' ? spec?.top?.[index] : spec?.main?.[index]
+  const activeTab = pane?.tabs?.[pane.active ?? 0]
+  const locked = activeTab?.content?.kind === 'builtin' && activeTab.content.type === 'console'
+  const left = Math.min(ctxMenu.x, Math.max(8, window.innerWidth - 210))
+  const top = Math.min(ctxMenu.y, Math.max(8, window.innerHeight - 240))
+  const act = (fn: () => void) => { setCtxMenu(null); fn() }
+  const add = (c: SplitContent) => act(() => splitStore.openTab(row, index, c))
+  return (
+    <div className="dsh-wt_ctxMenu dsh-wt_annotUi" style={{ position: 'fixed', left, top, zIndex: 5005 }}
+      onContextMenu={(e) => e.preventDefault()} onMouseDown={(e) => e.stopPropagation()}>
+      <div className="dsh-wt_ctxHead">{windowLabelOf(row, index)}</div>
+      <button type="button" className="dsh-wt_ctxItem" onClick={() => add({ kind: 'builtin', type: 'browser' })}><span aria-hidden>🌐</span>{T('pane.browser')}</button>
+      <button type="button" className="dsh-wt_ctxItem" onClick={() => add({ kind: 'builtin', type: 'anim' })}><span aria-hidden>🎬</span>{T('pane.anim')}</button>
+      <button type="button" className="dsh-wt_ctxItem" onClick={() => add({ kind: 'builtin', type: 'explorer' })}><span aria-hidden>📁</span>{T('pane.explorer')}</button>
+      <button type="button" className="dsh-wt_ctxItem" onClick={() => add({ kind: 'builtin', type: 'terminal' })}><span aria-hidden>▸_</span>{T('pane.terminal')}</button>
+      <button type="button" className="dsh-wt_ctxItem" onClick={() => add({ kind: 'builtin', type: 'custom' })}><span aria-hidden>✨</span>{T('pane.custom')}</button>
+      <div className="dsh-wt_ctxSep" aria-hidden />
+      {/* 布局随时修改：结构性拆分/关闭（VSCode 语义；左列整高单窗不支持） */}
+      {row !== 'left' && (
+        <>
+          <button type="button" className="dsh-wt_ctxItem" onClick={() => act(() => { splitStore.splitPane(row, index, 'right') })}><span aria-hidden>◫</span>{T('pane.splitRight')}</button>
+          <button type="button" className="dsh-wt_ctxItem" onClick={() => act(() => { splitStore.splitPane(row, index, 'down') })}><span aria-hidden>◱</span>{T('pane.splitDown')}</button>
+          {(row === 'top' ? (spec?.top?.length ?? 0) : (spec?.main?.length ?? 0)) > 1 && (
+            <button type="button" className="dsh-wt_ctxItem" onClick={() => act(() => { splitStore.closePane(row, index) })}><span aria-hidden>⊘</span>{T('pane.closePane')}</button>
+          )}
+        </>
+      )}
+      <div className="dsh-wt_ctxSep" aria-hidden />
+      <button type="button" className="dsh-wt_ctxItem" onClick={() => act(() => startAnnot(windowLabelOf(row, index)))}><span aria-hidden>📌</span>{T('annot.label')}</button>
+      {activeTab && !locked && (
+        <button type="button" className="dsh-wt_ctxItem" onClick={() => act(() => splitStore.closeTab(row, index, activeTab.id))}><span aria-hidden>✕</span>{T('pane.closeTab')}</button>
+      )}
+    </div>
+  )
+}
+
+/** 窗口清单（供对话感知工作台现状，避免重复造轮子）：
+ *  按「左栏 → 顶行 → 主行」顺序编号（与 windowLabelOf / 标注协议一致），
+ *  输出每个窗的编号、标题、当前标签及内容类型。 */
+export function buildWindowInventory(spec: LayoutSpec | null): string[] {
+  if (!spec) return []
+  const out: string[] = []
+  const describe = (c: SplitContent | null | undefined): string => {
+    if (!c) return '空（未指派，显示选择器）'
+    if (c.kind === 'iframe') return c.url ? '网页 ' + (safeHost(c.url) ?? c.url) : '网页（无 URL）'
+    if (c.kind === 'file') return '文件 ' + basenameOf(c.path)
+    if (c.kind === 'builtin') {
+      if (c.type === 'browser') return '浏览器窗' + (c.url ? '（' + (safeHost(c.url) ?? '') + '）' : '')
+      if (c.type === 'terminal') return '终端窗'
+      if (c.type === 'explorer') return '资源管理器'
+      if (c.type === 'custom') return '自定义任务窗'
+      if (c.type === 'anim') return '动画站' + (c.url ? '（' + (safeHost(c.url) ?? '') + '）' : '')
+      if (c.type === 'console') return '控制室'
+      return c.type
+    }
+    return '未知内容'
+  }
+  const rows: { row: PaneRow; index: number; pane: SplitPane | undefined }[] = []
+  if (spec.left) rows.push({ row: 'left', index: 0, pane: spec.left })
+  ;(spec.top ?? []).forEach((p, i) => rows.push({ row: 'top', index: i, pane: p }))
+  ;(spec.main ?? []).forEach((p, i) => rows.push({ row: 'main', index: i, pane: p }))
+  for (const { row, index, pane } of rows) {
+    if (!pane) continue
+    const tabs = pane.tabs ?? []
+    const active = pane.active ?? 0
+    const num = windowNumberOf(spec, row, index)
+    const title = pane.title ? '「' + pane.title + '」' : ''
+    const extra = tabs.length > 1 ? '（' + tabs.length + ' 个标签，当前第 ' + (active + 1) + ' 个）' : ''
+    const cur = tabs[active]
+    out.push('窗口' + num + title + extra + '：' + describe(cur?.content))
+  }
+  return out
+}
+
+/** 窗格标题栏状态小字（借鉴 DSH-P「面板通用能力」§4：把绑定对象变成看得见）。
+ *  只描述「当前装的是什么」，不读运行时错误——错误由各窗自己的错误区负责。 */
+export function paneStatusSub(c: SplitContent | null | undefined): string {
+  if (!c) return ''
+  if (c.kind === 'iframe') return c.url ? '网页 ' + (safeHost(c.url) ?? c.url) : '网页（无 URL）'
+  if (c.kind === 'file') return '文件 ' + basenameOf(c.path)
+  if (c.kind === 'builtin') {
+    if (c.type === 'browser') return c.url ? '浏览器 ' + (safeHost(c.url) ?? c.url) : '浏览器（未导航）'
+    if (c.type === 'anim') return c.url ? '动画站 ' + (safeHost(c.url) ?? c.url) : '动画站'
+    if (c.type === 'terminal') return '终端'
+    if (c.type === 'explorer') return '资源管理器'
+    if (c.type === 'custom') return '自定义任务'
+    if (c.type === 'console') return '控制室'
+    return c.type
+  }
+  return ''
+}
+
+/** 窗格编号（与 windowLabelOf 同一约定：左栏→顶行→主行，从 1 起） */
+function windowNumberOf(spec: LayoutSpec, row: PaneRow, index: number): number {
+  let num = spec.left ? 2 : 1
+  if (row === 'left') num = 1
+  else if (row === 'top') num = num + index
+  else num += (spec.top?.length ?? 0) + index
+  return num
+}
+
+function safeHost(u: string): string | null {
+  try { return new URL(u).hostname } catch { return null }
+}
+
+/** 拆分出的新窗格标题：
+ *  默认「窗口N」命名的窗格返回空标题 —— 由 windowLabelOf 按位置自动编号（与新建布局的窗口一致，不产生「窗口1 2」这种叠加）；
+ *  用户自定义过的标题才加「(2)」式后缀，且避开同行已占用的名字。 */
+function paneTitleFor(arr: SplitPane[], i: number): string {
+  const base = (arr[i]?.title ?? '').trim()
+  if (!base || /^窗口\d+$/.test(base)) return ''
+  const used = new Set(arr.map((p) => (p.title ?? '').trim()))
+  for (let n = 2; n < 20; n++) {
+    const candidate = base + ' (' + n + ')'
+    if (!used.has(candidate)) return candidate
+  }
+  return base + ' (' + arr.length + ')'
+}
+
+type PoolItem = { spec: LayoutSpec; chatW: number; topH: number; leftW: number; paneWs: number[]; topWs: number[]; lastActiveAt: number }
+
+/** 保活策略：活跃 + 最近用过 + 正在运行的工作台保留挂载（切回秒开、iframe/滚动不丢）；
+ *  长时间不用的卸载（省内存）；首次打开才挂载（懒加载）。 */
+const POOL_CAP = 12
+const IDLE_KEEP_MS = 3 * 60 * 1000
 
 /** 单个工作区渲染层（geom 为 null 时用 0 几何渲染，外层 display:none 保活，保留网页/MD 滚动/激活标签等状态） */
 function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: number; topH: number; leftW: number; paneWs: number[]; topWs: number[] }) {
@@ -2989,6 +3663,14 @@ function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: num
       className="dsh-wt_pane"
       data-drop-hover={dropTarget && dropTarget.row === row && dropTarget.index === index ? 'true' : undefined}
       style={{ position: 'fixed', left: x + it.left, top: y, width: it.width, height: h, zIndex: 68 }}
+      onContextMenu={(e: any) => {
+        if (annotState.on) return
+        const el = e.target as HTMLElement | null
+        if (el && el.closest && el.closest('.dsh-wt_ctxMenu')) return
+        e.preventDefault()
+        e.stopPropagation()
+        setCtxMenu({ x: e.clientX, y: e.clientY, row, index })
+      }}
       onDragOver={(e: any) => {
         if (!dragTab) return
         e.preventDefault()
@@ -3022,7 +3704,15 @@ function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: num
         }}
         onDragEnd={() => { dragPane = null }}
       >
-        <span className="dsh-wt_paneTitle">{it.pane.title}</span>
+        <span className="dsh-wt_paneTitle">{it.pane.title || ('窗口' + (spec ? windowNumberOf(spec, row, index) : ''))}</span>
+        {/* 状态小字（借鉴 DSH-P「面板通用能力」§4）：把当前绑定对象写在标题行，
+            用户不开控制台就能判断「这个窗现在装的是什么」——静默失败最难排查。 */}
+        {(() => {
+          const tabs = it.pane.tabs ?? []
+          const cur = tabs[it.pane.active ?? 0]
+          const sub = paneStatusSub(cur?.content)
+          return sub ? <span className="dsh-wt_paneSub" title={sub}>{sub}</span> : null
+        })()}
       </div>
       )}
       <PaneBody pane={it.pane} row={row} index={index} />
@@ -3125,6 +3815,7 @@ function WorkspaceLayer(props: { spec: LayoutSpec; geom: Geom | null; chatW: num
         onPointerDown={makeDividerHandler(hasLeft ? 'left' : 'chat')}
       />
       <AnnotationOverlay />
+      <CtxMenu />
     </>
   )
 }
@@ -3149,6 +3840,7 @@ function SplitWorkspace() {
   useEffect(() => splitStore.subscribe(() => {
     const spec = splitStore.spec
     if (splitStore.active && spec) {
+      const prevItem = poolRef.current.get(spec.id)
       poolRef.current.set(spec.id, {
         spec,
         chatW: splitStore.chatW,
@@ -3156,11 +3848,20 @@ function SplitWorkspace() {
         leftW: splitStore.leftW,
         paneWs: [...splitStore.paneWs],
         topWs: [...splitStore.topWs],
+        lastActiveAt: Date.now(),
       })
-      // 保活池上限 6 个（LRU：删最老的），避免长时间使用内存膨胀
-      while (poolRef.current.size > 6) {
-        const first = poolRef.current.keys().next().value
-        if (first != null) poolRef.current.delete(first)
+      // 内存上限（LRU）：活跃 + 正在运行的永不淘汰，其余按最近使用淘汰
+      while (poolRef.current.size > POOL_CAP) {
+        const activeId0 = splitStore.spec?.id
+        let victim: string | null = null
+        let oldest = Infinity
+        for (const [id, it] of poolRef.current) {
+          if (id === activeId0) continue
+          if (splitEnv?.isProjectRunning?.(id)) continue
+          if (it.lastActiveAt < oldest) { oldest = it.lastActiveAt; victim = id }
+        }
+        if (victim == null) break
+        poolRef.current.delete(victim)
       }
     }
     setSnap({
@@ -3191,6 +3892,22 @@ function SplitWorkspace() {
     const fn = () => setDropTick((t) => t + 1)
     dropTargetListeners.add(fn)
     return () => { dropTargetListeners.delete(fn) }
+  }, [])
+
+  // 空闲回收：长时间不用且非运行中的工作台卸载（省内存）；active 与运行中永不回收
+  useEffect(() => {
+    const iv = window.setInterval(() => {
+      const activeId0 = splitStore.active && splitStore.spec ? splitStore.spec.id : null
+      const now = Date.now()
+      let changed = false
+      for (const [id, it] of Array.from(poolRef.current)) {
+        if (id === activeId0) continue
+        if (splitEnv?.isProjectRunning?.(id)) continue
+        if (now - it.lastActiveAt > IDLE_KEEP_MS) { poolRef.current.delete(id); changed = true }
+      }
+      if (changed) setPoolTick((t) => t + 1)
+    }, 30000)
+    return () => window.clearInterval(iv)
   }, [])
 
   const activeId = snap.active && snap.spec ? snap.spec.id : null

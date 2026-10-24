@@ -12,10 +12,12 @@
  */
 import { createContext, runInNewContext } from 'node:vm'
 
-/** 客户端 external 精确白名单——当前真实 bundle 只 require react / react/jsx-runtime。
- *  新增任何宿主依赖必须显式审核后加入此清单（防引用已删除宿主模块导致白屏）。 */
+/** 客户端 external 精确白名单——真实 bundle require react / react-dom / react/jsx-runtime。
+ *  新增任何宿主依赖必须显式审核后加入此清单（防引用已删除宿主模块导致白屏）。
+ *  react-dom 用于 createPortal（把绑定弹窗 portal 到 body 置顶），宿主客户端模块表提供。 */
 export const CLIENT_EXTERNAL_ALLOW = [
   'react',
+  'react-dom',
   'react/jsx-runtime',
 ]
 
@@ -60,6 +62,7 @@ export function gateClientFactory(source, expectedId, expectedInject) {
     window: {},
     console: { log() {}, warn() {}, error() {} },
     setTimeout, clearTimeout,
+    queueMicrotask: (cb) => Promise.resolve().then(cb),  // 浏览器/Node 标准全局；vm 上下文不带，产物模块顶层会用到
     localStorage: localStorageStub,
     document: docStub,
     atob: (s) => Buffer.from(String(s), 'base64').toString('binary'),
@@ -114,7 +117,7 @@ export function gateClientFactory(source, expectedId, expectedInject) {
     throw new Error('unexpected external require: ' + id)
   }
   // 工厂调用放进受 timeout 控制的 vm 执行（防死循环卡死发布流程）
-  const runSandbox = { __factory: captured.factory, __requireStub: requireStub }
+  const runSandbox = { __factory: captured.factory, __requireStub: requireStub, queueMicrotask: (cb) => Promise.resolve().then(cb) }
   createContext(runSandbox)
   let exportsObj
   try {

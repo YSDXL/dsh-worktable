@@ -58,7 +58,19 @@ function resolveDshHomeSafe(): string {
 declare const __WT_VERSION__: string
 const PLUGIN_VERSION = typeof __WT_VERSION__ === 'undefined' ? 'dev' : __WT_VERSION__
 
+import {
+  DEFAULT_STANDING_LIMITS,
+  findProjectRoot,
+  memoryRootOf,
+  renderStandingPrompt,
+  writeMemoryFile,
+  memoryHistory,
+  memoryDirty,
+  restoreMemory,
+} from './memory'
+
 export const name = 'dsh-worktable'
+/** systemPrompt 可选：宿主未提供时跳过常驻记忆注入（不影响工作台本体） */
 export const inject = ['webServer', 'sessions']
 
 export const HEALTH_PATH = '/api/worktable/health'
@@ -145,6 +157,53 @@ function serverCwd(ctx: any, sessionId?: string, clientCwd?: string): string {
 function json(res: any, status: number, body: unknown) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(JSON.stringify(body))
+}
+
+/** 常驻记忆 section 名（自定义名字，order 用固定数值——getSectionOrder 只认内置键） */
+const MEMORY_SECTION = 'worktable:project-memory'
+/** 放在工具说明之后（TOOL_WEB_SEARCH=2000 之后），不与任何内置键抢位置 */
+const MEMORY_ORDER = 2400
+
+/** 从装配上下文里取当前会话 cwd（不同宿主版本字段位置可能不同，逐层探测） */
+function promptCwdOf(context: any): string {
+  const c = context ?? {}
+  const candidates = [
+    c.agent?.session?.header?.cwd,
+    c.session?.header?.cwd,
+    c.agent?.cwd,
+    c.cwd,
+    c.workingDirectory,
+    c.agent?.workingDirectory,
+  ]
+  for (const v of candidates) if (typeof v === 'string' && v.trim() !== '') return v
+  return ''
+}
+
+/** 注册常驻项目记忆 section（可选服务：systemPrompt 缺席时静默跳过） */
+function setupStandingMemory(ctx: any) {
+  let systemPrompt: any = null
+  try { systemPrompt = ctx.get?.('systemPrompt') ?? (ctx as any).systemPrompt } catch {}
+  if (!systemPrompt || typeof systemPrompt.section !== 'function') {
+    ctx.logger?.info?.('[dsh-worktable] 宿主无 systemPrompt 服务，跳过常驻记忆注入')
+    return
+  }
+  try {
+    systemPrompt.section({
+      name: MEMORY_SECTION,
+      order: MEMORY_ORDER,
+      interpolate: false,
+      text: (context: any) => {
+        const cwd = promptCwdOf(context)
+        if (!cwd) return ''
+        try {
+          const root = findProjectRoot(cwd)
+          return renderStandingPrompt(memoryRootOf(root), { ...DEFAULT_STANDING_LIMITS })
+        } catch { return '' }
+      },
+    })
+  } catch (err) {
+    ctx.logger?.warn?.('[dsh-worktable] 注册常驻记忆 section 失败：' + String(err))
+  }
 }
 
 async function readJsonBody(req: any): Promise<any> {
@@ -255,6 +314,11 @@ export function apply(ctx: Context) {
     ctx.logger?.warn('[dsh-worktable] ctx.webServer 不可用（headless profile？），跳过服务端路由')
     return
   }
+
+  // 常驻项目记忆：对齐 BotHarness 的 soul.ts——真正注入 system prompt，
+  // 每个文件有字符上限（超限截断 + 提示，磁盘文件不动），标题带用量百分比。
+  // systemPrompt 为可选服务：宿主未提供（旧版本）时静默跳过，不影响工作台本体。
+  setupStandingMemory(ctx)
 
   webServer.register({
     kind: 'exact',
@@ -450,6 +514,124 @@ export function apply(ctx: Context) {
         json(res, 200, { ok: true, path: abs })
       } catch (err: any) {
         json(res, err?.code === 'EEXIST' ? 200 : 500, err?.code === 'EEXIST' ? { ok: true, exists: true } : { error: String(err) })
+      }
+    },
+  })
+
+  // 保存记忆文件（原子写 + git 自动提交）：只允许记忆目录内的 .md
+  webServer.register({
+    kind: 'exact',
+    path: '/api/worktable/memory/save',
+    handler: async (req: any, res: any) => {
+      try {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+        const body = await readJsonBody(req)
+        const root = typeof body.root === 'string' ? body.root : ''
+        const file = typeof body.file === 'string' ? body.file : ''
+        const content = typeof body.content === 'string' ? body.content : ''
+        if (!root || !file) { json(res, 400, { error: 'missing root or file' }); return }
+        if (!/^[A-Za-z0-9._-]+\.(md|markdown)$/i.test(file)) { json(res, 400, { error: 'file must be a single .md name' }); return }
+        const absRoot = pathResolve(root)
+        const abs = pathResolve(absRoot, file)
+        if (absRoot !== pathResolve(abs, '..')) { json(res, 400, { error: 'outside memory root' }); return }
+        const sha = writeMemoryFile(absRoot, file, content, body.summary && typeof body.summary === 'string' ? body.summary : 'Update ' + file)
+        json(res, 200, { ok: true, commit: sha })
+      } catch (err) {
+        json(res, 500, { error: String(err) })
+      }
+    },
+  })
+
+  // 记忆历史 / 恢复（Git 版本化）
+  webServer.register({
+    kind: 'exact',
+    path: '/api/worktable/memory/history',
+    handler: async (req: any, res: any) => {
+      try {
+        const u = new URL(req.url ?? '/', 'http://dsh.internal')
+        const root = u.searchParams.get('root') || ''
+        if (!root) { json(res, 400, { error: 'missing root' }); return }
+        const absRoot = pathResolve(root)
+        json(res, 200, { ok: true, commits: memoryHistory(absRoot), dirty: memoryDirty(absRoot) })
+      } catch (err) {
+        json(res, 500, { error: String(err) })
+      }
+    },
+  })
+
+  webServer.register({
+    kind: 'exact',
+    path: '/api/worktable/memory/restore',
+    handler: async (req: any, res: any) => {
+      try {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+        const body = await readJsonBody(req)
+        const root = typeof body.root === 'string' ? body.root : ''
+        const sha = typeof body.sha === 'string' ? body.sha : ''
+        if (!root || !sha) { json(res, 400, { error: 'missing root or sha' }); return }
+        const out = restoreMemory(pathResolve(root), sha)
+        if (!out.ok) { json(res, 400, { error: out.error ?? 'restore failed' }); return }
+        json(res, 200, { ok: true })
+      } catch (err) {
+        json(res, 500, { error: String(err) })
+      }
+    },
+  })
+
+  // 编队日记：向 knowledge 仓 diary/YYYY-MM-DD.md 追加一条并提交推送（who/text 由前端给）
+  webServer.register({
+    kind: 'exact',
+    path: '/api/worktable/diary',
+    handler: async (req: any, res: any) => {
+      try {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+        const body = await readJsonBody(req)
+        const repo = typeof body.repo === 'string' ? body.repo : ''
+        const who = typeof body.who === 'string' ? body.who.trim() : ''
+        const text = typeof body.text === 'string' ? body.text.trim() : ''
+        if (!repo || !who || !text) { json(res, 400, { error: 'missing repo / who / text' }); return }
+        if (text.length > 8000) { json(res, 400, { error: 'text too long' }); return }
+        const abs = pathResolve(repo)
+        const fsx = await import('node:fs/promises')
+        try { await fsx.access(pathResolve(abs, '.git')) } catch { json(res, 400, { error: '不是 git 仓库：' + abs }); return }
+        const d = new Date()
+        const day = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
+        const hhmm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+        const rel = 'diary/' + day + '.md'
+        const file = pathResolve(abs, ...rel.split('/'))
+        if (!file.startsWith(abs + sep)) { json(res, 400, { error: 'path escape' }); return }
+        try { await gitExec(['pull', '--rebase', '--autostash'], abs) } catch { /* 离线/冲突不阻断本地记录 */ }
+        let old = ''
+        try { old = await fsx.readFile(file, 'utf8') } catch { old = '# ' + day + '\n' }
+        const entry = '\n## ' + hhmm + ' ' + who + '\n\n' + text.split('\n').map((l: string) => '- ' + l).join('\n') + '\n'
+        await fsx.writeFile(file, (old.endsWith('\n') ? old : old + '\n') + entry, 'utf8')
+        await gitExec(['add', '--', rel], abs)
+        await gitExec(['-c', 'user.name=dsh', '-c', 'user.email=dsh@fleet.local', 'commit', '--no-gpg-sign', '--quiet', '-m', '日记 ' + day + ' ' + who], abs)
+        let pushed = false
+        try { await gitExec(['push', '--quiet', 'origin', 'HEAD'], abs); pushed = true } catch { /* push 失败保留本地提交 */ }
+        json(res, 200, { ok: true, file: rel, pushed })
+      } catch (err) {
+        json(res, 500, { error: String(err) })
+      }
+    },
+  })
+
+  // 删除文件（项目记忆面板：只允许 .md，防误删其他文件）
+  webServer.register({
+    kind: 'exact',
+    path: '/api/worktable/delete',
+    handler: async (req: any, res: any) => {
+      try {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return }
+        const body = await readJsonBody(req)
+        const p = typeof body.path === 'string' ? body.path : ''
+        if (!p) { json(res, 400, { error: 'missing path' }); return }
+        if (!/\.(md|markdown)$/i.test(p)) { json(res, 400, { error: 'only .md files can be deleted here' }); return }
+        const abs = pathResolve(p)
+        await import('node:fs/promises').then((m) => m.unlink(abs))
+        json(res, 200, { ok: true })
+      } catch (err) {
+        json(res, 500, { error: String(err) })
       }
     },
   })
